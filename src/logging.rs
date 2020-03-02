@@ -23,10 +23,17 @@ impl log::Log for KernelLogger {
 	fn log(&self, record: &Record) {
 		if self.enabled(record.metadata()) {
 			println!(
-				"[{}][{}] {}",
+				"[{}][{:<5}]{:<60}{}",
 				crate::arch::percore::core_id(),
-				record.level(),
-				record.args()
+				record.level(), // INFO, DEBUG, ...
+				format!(
+					"[{}:{}]",
+					//record.target(), // eg hermit::arch::x86_64::kernel::virtio_fs
+					record.file().unwrap(), // eg libhermit-rs/src/scheduler/mod.rs
+					//&record.file().unwrap()[17..], // eg scheduler/mod.rs
+					record.line().unwrap(), // eg 123
+				),
+				record.args() // Actual formatted log message
 			);
 		}
 	}
