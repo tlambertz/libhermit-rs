@@ -161,14 +161,14 @@ fn has_ipdevice() -> bool {
 extern "C" fn initd(_arg: usize) {
 	extern "C" {
 		fn runtime_entry(argc: i32, argv: *const *const u8, env: *const *const u8) -> !;
-		#[cfg(feature = "newlib")]
+		#[cfg(feature = "lwip")]
 		fn init_lwip();
-		#[cfg(feature = "newlib")]
+		#[cfg(feature = "lwip")]
 		fn init_uhyve_netif() -> i32;
 	}
 
 	// initialize LwIP library for newlib-based applications
-	#[cfg(feature = "newlib")]
+	#[cfg(feature = "lwip")]
 	unsafe {
 		if has_ipdevice() {
 			init_lwip();
@@ -179,7 +179,7 @@ extern "C" fn initd(_arg: usize) {
 		// Initialize the uhyve-net interface using the IP and gateway addresses specified in hcip, hcmask, hcgateway.
 		info!("HermitCore is running on uhyve!");
 		if has_ipdevice() {
-			#[cfg(feature = "newlib")]
+			#[cfg(feature = "lwip")]
 			unsafe {
 				init_uhyve_netif();
 			}

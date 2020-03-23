@@ -9,7 +9,7 @@
 mod condvar;
 pub mod fs;
 mod interfaces;
-#[cfg(feature = "newlib")]
+#[cfg(feature = "lwip")]
 mod lwip;
 mod processor;
 mod random;
@@ -36,7 +36,7 @@ use environment;
 use synch::spinlock::SpinlockIrqSave;
 use syscalls::interfaces::SyscallInterface;
 
-#[cfg(feature = "newlib")]
+#[cfg(feature = "lwip")]
 const LWIP_FD_BIT: i32 = 1 << 30;
 
 #[cfg(feature = "newlib")]

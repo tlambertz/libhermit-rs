@@ -387,7 +387,7 @@ pub struct Task {
 	/// Reason why wakeup() has been called the last time
 	pub last_wakeup_reason: WakeupReason,
 	/// lwIP error code for this task
-	#[cfg(feature = "newlib")]
+	#[cfg(feature = "lwip")]
 	pub lwip_errno: i32,
 }
 
@@ -419,7 +419,7 @@ impl Task {
 			prev: None,
 			tls: None,
 			last_wakeup_reason: WakeupReason::Custom,
-			#[cfg(feature = "newlib")]
+			#[cfg(feature = "lwip")]
 			lwip_errno: 0,
 		}
 	}
@@ -440,7 +440,7 @@ impl Task {
 			prev: None,
 			tls: None,
 			last_wakeup_reason: WakeupReason::Custom,
-			#[cfg(feature = "newlib")]
+			#[cfg(feature = "lwip")]
 			lwip_errno: 0,
 		}
 	}
@@ -461,7 +461,7 @@ impl Task {
 			prev: None,
 			tls: task.tls.clone(),
 			last_wakeup_reason: task.last_wakeup_reason,
-			#[cfg(feature = "newlib")]
+			#[cfg(feature = "lwip")]
 			lwip_errno: 0,
 		}
 	}

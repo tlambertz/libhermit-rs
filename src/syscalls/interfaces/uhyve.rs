@@ -9,9 +9,9 @@ use arch;
 use arch::mm::paging;
 use core::{mem, ptr, slice};
 use syscalls::interfaces::SyscallInterface;
-#[cfg(feature = "newlib")]
+#[cfg(feature = "lwip")]
 use syscalls::lwip::sys_lwip_get_errno;
-#[cfg(feature = "newlib")]
+#[cfg(feature = "lwip")]
 use syscalls::{LWIP_FD_BIT, LWIP_LOCK};
 
 #[cfg(target_arch = "x86_64")]
@@ -27,7 +27,7 @@ const UHYVE_PORT_CMDSIZE: u16 = 0x740;
 const UHYVE_PORT_CMDVAL: u16 = 0x780;
 const UHYVE_PORT_UNLINK: u16 = 0x840;
 
-#[cfg(feature = "newlib")]
+#[cfg(feature = "lwip")]
 extern "C" {
 	fn lwip_write(fd: i32, buf: *const u8, len: usize) -> i32;
 	fn lwip_read(fd: i32, buf: *mut u8, len: usize) -> i32;
@@ -295,7 +295,7 @@ impl SyscallInterface for Uhyve {
 
 	fn read(&self, fd: i32, buf: *mut u8, len: usize) -> isize {
 		// do we have an LwIP file descriptor?
-		#[cfg(feature = "newlib")]
+		#[cfg(feature = "lwip")]
 		{
 			if (fd & LWIP_FD_BIT) != 0 {
 				// take lock to protect LwIP
@@ -321,7 +321,7 @@ impl SyscallInterface for Uhyve {
 
 	fn write(&self, fd: i32, buf: *const u8, len: usize) -> isize {
 		// do we have an LwIP file descriptor?
-		#[cfg(feature = "newlib")]
+		#[cfg(feature = "lwip")]
 		{
 			if (fd & LWIP_FD_BIT) != 0 {
 				// take lock to protect LwIP

@@ -29,6 +29,7 @@ vga = []
 newlib = []
 pci = []
 acpi = []
+lwip = []
 
 [dependencies]
 bitflags = "1.2"
