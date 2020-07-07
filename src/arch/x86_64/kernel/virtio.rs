@@ -38,6 +38,8 @@ pub mod consts {
 	pub const VIRTIO_PCI_CAP_DEVICE_CFG: u32 = 4;
 	/* PCI configuration access */
 	pub const VIRTIO_PCI_CAP_PCI_CFG: u32 = 5;
+	/* PCI Shared Memory */
+	pub const VIRTIO_PCI_CAP_SHARED_MEMORY_CFG: u32 = 8;
 
 	pub const VIRTIO_F_RING_INDIRECT_DESC: u64 = 1 << 28;
 	pub const VIRTIO_F_RING_EVENT_IDX: u64 = 1 << 29;
@@ -724,56 +726,123 @@ impl VirtioNotification {
 	}
 }
 
+#[repr(C)]
+pub struct virtio_shm_region {
+	pub addr: *mut u64,
+	pub len: u64,
+}
+
+pub fn find_virtiocap(
+	adapter: &PciAdapter,
+	virtiocaptype: u32,
+	id: Option<u8>,
+) -> Option<pci::PciCapability> {
+	adapter.scan_capabilities(
+		Some(pci::PCI_CAP_ID_VNDR),
+		&mut |cap: pci::PciCapability| -> Option<pci::PciCapability> {
+			// we are vendor defined, with virtio vendor --> we can check for virtio cap type
+			let captypeword = cap.read_offset(0);
+			let captype = (captypeword >> 24) & 0xFF;
+			debug!("found vendor, virtio type: {}", captype);
+			if captype == virtiocaptype {
+				// Type matches, now check ID if given
+				if let Some(tid) = id {
+					let cid: u8 = ((cap.read_offset(4) >> 8) & 0xFF) as u8; // get offset_of!(virtio_pci_cap, id)
+					if cid == tid {
+						// cap and id match, return cap
+						return Some(cap);
+					}
+				} else {
+					// dont check ID, we have found cap
+					return Some(cap);
+				}
+			}
+			None
+		},
+	)
+}
+
+/// memory maps a pci capability
+pub fn map_cap(adapter: &pci::PciAdapter, cap: &pci::PciCapability) -> Option<(usize, usize)> {
+	// TODO: assert this cap is virtiocap?
+	// TODO: cleanup 'hacky' type conversions
+
+	// Since we have verified caplistoffset to be virtio_pci_cap common config, read fields.
+	let baridx: u8 = (cap.read_offset(4) & 0xFF) as u8; // get offset_of!(virtio_pci_cap, bar)
+	let offset: usize = cap.read_offset(8) as usize; // get offset_of!(virtio_pci_cap, offset)
+	let length: usize = cap.read_offset(12) as usize; // get offset_of!(virtio_pci_cap, length)
+
+	// corrosponding setup in eg Qemu @ https://github.com/qemu/qemu/blob/master/hw/virtio/virtio-pci.c#L1590 (virtio_pci_device_plugged)
+	if let Some((virtualbaraddr, size)) = adapter.memory_map_bar(baridx, true) {
+		let virtualcapaddr = virtualbaraddr + offset;
+
+		if size < offset + length {
+			error!(
+				"virtio config struct does not fit in bar! Aborting! 0x{:x} < 0x{:x}",
+				size,
+				offset + length
+			);
+			return None;
+		}
+
+		Some((virtualcapaddr, length))
+	} else {
+		None
+	}
+}
+
+pub fn get_shm_config(adapter: &PciAdapter, shm_id: u8) -> Option<(usize, usize)> {
+	let cap = find_virtiocap(adapter, VIRTIO_PCI_CAP_SHARED_MEMORY_CFG, Some(shm_id)).unwrap();
+	let mapped = map_cap(adapter, &cap);
+
+	mapped
+}
+
+pub fn get_notify_config(adapter: &pci::PciAdapter) -> Option<VirtioNotification> {
+	let cap = find_virtiocap(adapter, VIRTIO_PCI_CAP_NOTIFY_CFG, None).unwrap();
+	let mapped = map_cap(adapter, &cap);
+
+	if let Some((addr, _length)) = mapped {
+		let notify_off_multiplier: u32 = cap.read_offset(16); // get offset_of!(virtio_pci_notify_cap, notify_off_multiplier)
+		let notify_cfg = VirtioNotification {
+			notification_ptr: addr as *mut u16,
+			notify_off_multiplier,
+		};
+		Some(notify_cfg)
+	} else {
+		None
+	}
+}
+
+pub fn get_common_config(adapter: &pci::PciAdapter) -> Option<&'static mut virtio_pci_common_cfg> {
+	let cap = find_virtiocap(adapter, VIRTIO_PCI_CAP_COMMON_CFG, None).unwrap();
+	let mapped = map_cap(adapter, &cap);
+
+	if let Some((addr, _length)) = mapped {
+		let cfg = unsafe { &mut *(addr as *mut virtio_pci_common_cfg) };
+		Some(cfg)
+	} else {
+		None
+	}
+}
+
 /// Scans pci-capabilities for a virtio-capability of type virtiocaptype.
 /// When found, maps it into memory and returns virtual address, else None
 pub fn map_virtiocap(
-	bus: u8,
-	device: u8,
+	_bus: u8,
+	_device: u8,
 	adapter: &PciAdapter,
-	caplist: u32,
+	_caplist: u32,
 	virtiocaptype: u32,
 ) -> Option<(usize, u32)> {
-	let mut nextcaplist = caplist;
-	if nextcaplist < 0x40 {
-		error!(
-			"Caplist inside header! Offset: 0x{:x}, Aborting",
-			nextcaplist
-		);
-		return None;
-	}
+	let cap = find_virtiocap(adapter, virtiocaptype, None).unwrap();
 
-	// Debug dump all
-	/*for x in (0..255).step_by(4) {
-			debug!("{:02x}: {:08x}", x, pci::read_config(bus, device, x));
-	}*/
-
-	// Loop through capabilities until vendor (virtio) defined one is found
-	let virtiocapoffset = loop {
-		if nextcaplist == 0 || nextcaplist < 0x40 {
-			error!("Next caplist invalid, and still not found the wanted virtio cap, aborting!");
-			return None;
-		}
-		let captypeword = pci::read_config(bus, device, nextcaplist);
-		debug!(
-			"Read cap at offset 0x{:x}: captype 0x{:x}",
-			nextcaplist, captypeword
-		);
-		let captype = captypeword & 0xFF; // pci cap type
-		if captype == pci::PCI_CAP_ID_VNDR {
-			// we are vendor defined, with virtio vendor --> we can check for virtio cap type
-			debug!("found vendor, virtio type: {}", (captypeword >> 24) & 0xFF);
-			if (captypeword >> 24) & 0xFF == virtiocaptype {
-				break nextcaplist;
-			}
-		}
-		nextcaplist = (captypeword >> 8) & 0xFF; // pci cap next ptr
-	};
 	// Since we have verified caplistoffset to be virtio_pci_cap common config, read fields.
 	// TODO: cleanup 'hacky' type conversions
-	let baridx: u8 = (pci::read_config(bus, device, virtiocapoffset + 4) & 0xFF) as u8; // get offset_of!(virtio_pci_cap, bar)
-	let offset: usize = pci::read_config(bus, device, virtiocapoffset + 8) as usize; // get offset_of!(virtio_pci_cap, offset)
-	let length: usize = pci::read_config(bus, device, virtiocapoffset + 12) as usize; // get offset_of!(virtio_pci_cap, length)
-	debug!(
+	let baridx: u8 = (cap.read_offset(4) & 0xFF) as u8; // get offset_of!(virtio_pci_cap, bar)
+	let offset: usize = cap.read_offset(8) as usize; // get offset_of!(virtio_pci_cap, offset)
+	let length: usize = cap.read_offset(12) as usize; // get offset_of!(virtio_pci_cap, length)
+	info!(
 		"Found virtio config bar as 0x{:x}, offset 0x{:x}, length 0x{:x}",
 		baridx, offset, length
 	);
@@ -792,7 +861,7 @@ pub fn map_virtiocap(
 		}
 
 		if virtiocaptype == VIRTIO_PCI_CAP_NOTIFY_CFG {
-			let notify_off_multiplier: u32 = pci::read_config(bus, device, virtiocapoffset + 16); // get offset_of!(virtio_pci_notify_cap, notify_off_multiplier)
+			let notify_off_multiplier: u32 = cap.read_offset(16); // get offset_of!(virtio_pci_notify_cap, notify_off_multiplier)
 			Some((virtualcapaddr, notify_off_multiplier))
 		} else {
 			Some((virtualcapaddr, 0))
