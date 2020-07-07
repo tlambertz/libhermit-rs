@@ -14,8 +14,12 @@ use crate::syscalls::fs;
 use crate::util;
 
 use alloc::boxed::Box;
+use alloc::rc::Rc;
 use alloc::vec::Vec;
+use core::cell::RefCell;
 use core::{fmt, u32, u8};
+
+pub const VIRTIO_FS_SHMCAP_ID_CACHE: u8 = 0;
 
 #[repr(C)]
 struct virtio_fs_config {
@@ -234,7 +238,20 @@ impl FuseInterface for VirtioFsDriver<'_> {
 	*/
 }
 
-pub fn create_virtiofs_driver(adapter: &pci::PciAdapter) -> Option<VirtioFsDriver<'static>> {
+fn get_device_config(adapter: &pci::PciAdapter) -> Option<&'static mut virtio_fs_config> {
+	let cap = virtio::find_virtiocap(adapter, VIRTIO_PCI_CAP_DEVICE_CFG, None).unwrap();
+	let mapped = virtio::map_cap(adapter, &cap);
+
+	if let Some((cap_device_raw, _length)) = mapped {
+		Some(unsafe { &mut *(cap_device_raw as *mut virtio_fs_config) })
+	} else {
+		None
+	}
+}
+
+pub fn create_virtiofs_driver(
+	adapter: &pci::PciAdapter,
+) -> Option<Rc<RefCell<VirtioFsDriver<'static>>>> {
 	// Scan capabilities to get common config, which we need to reset the device and get basic info.
 	// also see https://elixir.bootlin.com/linux/latest/source/drivers/virtio/virtio_pci_modern.c#L581 (virtio_pci_modern_probe)
 	// Read status register
@@ -248,66 +265,53 @@ pub fn create_virtiofs_driver(adapter: &pci::PciAdapter) -> Option<VirtioFsDrive
 		return None;
 	}
 
-	// Get pointer to capability list
-	let caplist = pci::read_config(bus, device, pci::PCI_CAPABILITY_LIST_REGISTER) & 0xFF;
-
 	// get common config mapped, cast to virtio_pci_common_cfg
-	let common_cfg =
-		match virtio::map_virtiocap(bus, device, adapter, caplist, VIRTIO_PCI_CAP_COMMON_CFG) {
-			Some((cap_common_raw, _)) => unsafe {
-				&mut *(cap_common_raw.as_mut_ptr::<virtio_pci_common_cfg>())
-			},
-			None => {
-				error!("Could not find VIRTIO_PCI_CAP_COMMON_CFG. Aborting!");
-				return None;
-			}
-		};
-	// get device config mapped, cast to virtio_fs_config
-	let device_cfg =
-		match virtio::map_virtiocap(bus, device, adapter, caplist, VIRTIO_PCI_CAP_DEVICE_CFG) {
-			Some((cap_device_raw, _)) => unsafe {
-				&mut *(cap_device_raw.as_mut_ptr::<virtio_fs_config>())
-			},
-			None => {
-				error!("Could not find VIRTIO_PCI_CAP_DEVICE_CFG. Aborting!");
-				return None;
-			}
-		};
-	// get device notifications mapped
-	let (notification_ptr, notify_off_multiplier) =
-		match virtio::map_virtiocap(bus, device, adapter, caplist, VIRTIO_PCI_CAP_NOTIFY_CFG) {
-			Some((cap_notification_raw, notify_off_multiplier)) => {
-				(
-					cap_notification_raw.as_mut_ptr::<u16>(), // unsafe { core::slice::from_raw_parts_mut::<u16>(...)}
-					notify_off_multiplier,
-				)
-			}
-			None => {
-				error!("Could not find VIRTIO_PCI_CAP_NOTIFY_CFG. Aborting!");
-				return None;
-			}
-		};
-	let notify_cfg = VirtioNotification {
-		notification_ptr,
-		notify_off_multiplier,
+	let common_cfg = if let Some(c) = virtio::get_common_config(adapter) {
+		c
+	} else {
+		error!("Could not find VIRTIO_PCI_CAP_COMMON_CFG. Aborting!");
+		return None;
 	};
+
+	// get device config mapped, cast to virtio_fs_config
+	let device_cfg = if let Some(d) = get_device_config(adapter) {
+		d
+	} else {
+		error!("Could not find VIRTIO_PCI_CAP_DEVICE_CFG. Aborting!");
+		return None;
+	};
+
+	let notify_cfg = if let Some(n) = virtio::get_notify_config(adapter) {
+		n
+	} else {
+		error!("Could not find VIRTIO_PCI_CAP_NOTIFY_CFG. Aborting!");
+		return None;
+	};
+
+	let shm_cfg = virtio::get_shm_config(adapter, VIRTIO_FS_SHMCAP_ID_CACHE);
+
+	if let Some((addr, len)) = shm_cfg {
+		info!("Found Cache! Using DAX! {:x}, {:x}", addr, len);
+	} else {
+		info!("No Cache found, not using DAX!");
+	}
 
 	// TODO: also load the other 2 cap types (?).
 
 	// Instanciate driver on heap, so it outlives this function
-	let mut drv = VirtioFsDriver {
+	let drv = Rc::new(RefCell::new(VirtioFsDriver {
 		common_cfg,
 		device_cfg,
 		notify_cfg,
 		vqueues: None,
-	};
+	}));
 
 	trace!("Driver before init: {:?}", drv);
-	drv.init();
+	drv.borrow_mut().init();
 	trace!("Driver after init: {:?}", drv);
 
 	// Instanciate global fuse object
-	let fuse = fuse::Fuse::new();
+	let fuse = fuse::Fuse::new(drv.clone());
 
 	// send FUSE_INIT to create session
 	fuse.send_init();

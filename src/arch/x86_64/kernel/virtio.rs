@@ -15,9 +15,7 @@ use crate::arch::x86_64::kernel::virtio_fs;
 use crate::arch::x86_64::kernel::virtio_net;
 
 use crate::arch::x86_64::mm::paging;
-use crate::arch::x86_64::mm::VirtAddr;
 use crate::config::VIRTIO_MAX_QUEUE_SIZE;
-use crate::synch::spinlock::SpinlockIrqSave;
 
 use alloc::boxed::Box;
 use alloc::rc::Rc;
@@ -40,6 +38,8 @@ pub mod consts {
 	pub const VIRTIO_PCI_CAP_DEVICE_CFG: u32 = 4;
 	/* PCI configuration access */
 	pub const VIRTIO_PCI_CAP_PCI_CFG: u32 = 5;
+	/* PCI Shared Memory */
+	pub const VIRTIO_PCI_CAP_SHARED_MEMORY_CFG: u32 = 8;
 
 	pub const VIRTIO_F_RING_INDIRECT_DESC: u64 = 1 << 28;
 	pub const VIRTIO_F_RING_EVENT_IDX: u64 = 1 << 29;
@@ -52,16 +52,13 @@ pub mod consts {
 	pub const VIRTIO_F_NOTIFICATION_DATA: u64 = 1 << 38;
 
 	// Descriptor flags
-	pub const VIRTQ_DESC_F_DEFAULT: u16 = 0;
 	pub const VIRTQ_DESC_F_NEXT: u16 = 1; // Buffer continues via next field
 	pub const VIRTQ_DESC_F_WRITE: u16 = 2; // Buffer is device write-only (instead of read-only)
 	pub const VIRTQ_DESC_F_INDIRECT: u16 = 4; // Buffer contains list of virtq_desc
 
-	// The guest uses this in flag to advise the host: don't interrupt me
+	// The Guest uses this in flag to advise the Host: don't interrupt me
 	// when you consume a buffer.
 	pub const VRING_AVAIL_F_NO_INTERRUPT: u16 = 1;
-	/// Default behaviour, where the guest expects interrupts from the host
-	pub const VRING_AVAIL_F_DEFAULT: u16 = 0;
 }
 
 pub struct Virtq<'a> {
@@ -169,11 +166,9 @@ impl<'a> Virtq<'a> {
 		// Tell device about the guest-physical addresses of our queue structs:
 		// TODO: cleanup pointer conversions (use &mut vq....?)
 		common_cfg.queue_select = index;
-		common_cfg.queue_desc = paging::virt_to_phys(VirtAddr(desc_table.as_ptr() as u64)).as_u64();
-		common_cfg.queue_avail =
-			paging::virt_to_phys(VirtAddr(avail_flags as *mut _ as u64)).as_u64();
-		common_cfg.queue_used =
-			paging::virt_to_phys(VirtAddr(used_flags as *const _ as u64)).as_u64();
+		common_cfg.queue_desc = paging::virt_to_phys(desc_table.as_ptr() as usize) as u64;
+		common_cfg.queue_avail = paging::virt_to_phys(avail_flags as *mut _ as usize) as u64;
+		common_cfg.queue_used = paging::virt_to_phys(used_flags as *const _ as usize) as u64;
 		common_cfg.queue_enable = 1;
 
 		debug!(
@@ -292,7 +287,7 @@ impl<'a> Virtq<'a> {
 			let req = &mut chain.0.last_mut().unwrap().raw;
 
 			// 2. Set d.addr to the physical address of the start of b
-			req.addr = paging::virt_to_phys(VirtAddr(dat.as_ptr() as u64)).as_u64();
+			req.addr = paging::virt_to_phys(dat.as_ptr() as usize) as u64;
 
 			// 3. Set d.len to the length of b.
 			req.len = dat.len() as u32; // TODO: better cast?
@@ -312,7 +307,7 @@ impl<'a> Virtq<'a> {
 			for dat in rsp_buf {
 				self.virtq_desc.extend(&mut chain);
 				let rsp = &mut chain.0.last_mut().unwrap().raw;
-				rsp.addr = paging::virt_to_phys(VirtAddr(dat.as_ptr() as u64)).as_u64();
+				rsp.addr = paging::virt_to_phys(dat.as_ptr() as usize) as u64;
 				rsp.len = dat.len() as u32; // TODO: better cast?
 				rsp.flags = VIRTQ_DESC_F_WRITE;
 				trace!("written in descriptor: {:?} @ {:p}", rsp, rsp);
@@ -374,12 +369,12 @@ impl<'a> Virtq<'a> {
 		vqused.check_elements()
 	}
 
-	pub fn add_buffer(&mut self, index: usize, addr: VirtAddr, len: usize, flags: u16) {
+	pub fn add_buffer(&mut self, index: usize, addr: u64, len: usize, flags: u16) {
 		let chainrc = self.virtq_desc.get_empty_chain();
 		let mut chain = chainrc.borrow_mut();
 		self.virtq_desc.extend(&mut chain);
 		let rsp = &mut chain.0.last_mut().unwrap().raw;
-		rsp.addr = paging::virt_to_phys(addr).as_u64();
+		rsp.addr = paging::virt_to_phys(addr as usize) as u64;
 		rsp.len = len.try_into().unwrap();
 		rsp.flags = flags;
 
@@ -400,15 +395,6 @@ impl<'a> Virtq<'a> {
 		} else {
 			let aind = index % self.vqsize as usize;
 			vqavail.ring[aind] = chain.0.first().unwrap().index;
-		}
-	}
-
-	pub fn set_polling_mode(&mut self, value: bool) {
-		let mut vqavail = self.avail.borrow_mut();
-		if value {
-			*vqavail.flags = VRING_AVAIL_F_NO_INTERRUPT;
-		} else {
-			*vqavail.flags = VRING_AVAIL_F_DEFAULT;
 		}
 	}
 
@@ -740,56 +726,123 @@ impl VirtioNotification {
 	}
 }
 
+#[repr(C)]
+pub struct virtio_shm_region {
+	pub addr: *mut u64,
+	pub len: u64,
+}
+
+pub fn find_virtiocap(
+	adapter: &PciAdapter,
+	virtiocaptype: u32,
+	id: Option<u8>,
+) -> Option<pci::PciCapability> {
+	adapter.scan_capabilities(
+		Some(pci::PCI_CAP_ID_VNDR),
+		&mut |cap: pci::PciCapability| -> Option<pci::PciCapability> {
+			// we are vendor defined, with virtio vendor --> we can check for virtio cap type
+			let captypeword = cap.read_offset(0);
+			let captype = (captypeword >> 24) & 0xFF;
+			debug!("found vendor, virtio type: {}", captype);
+			if captype == virtiocaptype {
+				// Type matches, now check ID if given
+				if let Some(tid) = id {
+					let cid: u8 = ((cap.read_offset(4) >> 8) & 0xFF) as u8; // get offset_of!(virtio_pci_cap, id)
+					if cid == tid {
+						// cap and id match, return cap
+						return Some(cap);
+					}
+				} else {
+					// dont check ID, we have found cap
+					return Some(cap);
+				}
+			}
+			None
+		},
+	)
+}
+
+/// memory maps a pci capability
+pub fn map_cap(adapter: &pci::PciAdapter, cap: &pci::PciCapability) -> Option<(usize, usize)> {
+	// TODO: assert this cap is virtiocap?
+	// TODO: cleanup 'hacky' type conversions
+
+	// Since we have verified caplistoffset to be virtio_pci_cap common config, read fields.
+	let baridx: u8 = (cap.read_offset(4) & 0xFF) as u8; // get offset_of!(virtio_pci_cap, bar)
+	let offset: usize = cap.read_offset(8) as usize; // get offset_of!(virtio_pci_cap, offset)
+	let length: usize = cap.read_offset(12) as usize; // get offset_of!(virtio_pci_cap, length)
+
+	// corrosponding setup in eg Qemu @ https://github.com/qemu/qemu/blob/master/hw/virtio/virtio-pci.c#L1590 (virtio_pci_device_plugged)
+	if let Some((virtualbaraddr, size)) = adapter.memory_map_bar(baridx, true) {
+		let virtualcapaddr = virtualbaraddr + offset;
+
+		if size < offset + length {
+			error!(
+				"virtio config struct does not fit in bar! Aborting! 0x{:x} < 0x{:x}",
+				size,
+				offset + length
+			);
+			return None;
+		}
+
+		Some((virtualcapaddr, length))
+	} else {
+		None
+	}
+}
+
+pub fn get_shm_config(adapter: &PciAdapter, shm_id: u8) -> Option<(usize, usize)> {
+	let cap = find_virtiocap(adapter, VIRTIO_PCI_CAP_SHARED_MEMORY_CFG, Some(shm_id)).unwrap();
+	let mapped = map_cap(adapter, &cap);
+
+	mapped
+}
+
+pub fn get_notify_config(adapter: &pci::PciAdapter) -> Option<VirtioNotification> {
+	let cap = find_virtiocap(adapter, VIRTIO_PCI_CAP_NOTIFY_CFG, None).unwrap();
+	let mapped = map_cap(adapter, &cap);
+
+	if let Some((addr, _length)) = mapped {
+		let notify_off_multiplier: u32 = cap.read_offset(16); // get offset_of!(virtio_pci_notify_cap, notify_off_multiplier)
+		let notify_cfg = VirtioNotification {
+			notification_ptr: addr as *mut u16,
+			notify_off_multiplier,
+		};
+		Some(notify_cfg)
+	} else {
+		None
+	}
+}
+
+pub fn get_common_config(adapter: &pci::PciAdapter) -> Option<&'static mut virtio_pci_common_cfg> {
+	let cap = find_virtiocap(adapter, VIRTIO_PCI_CAP_COMMON_CFG, None).unwrap();
+	let mapped = map_cap(adapter, &cap);
+
+	if let Some((addr, _length)) = mapped {
+		let cfg = unsafe { &mut *(addr as *mut virtio_pci_common_cfg) };
+		Some(cfg)
+	} else {
+		None
+	}
+}
+
 /// Scans pci-capabilities for a virtio-capability of type virtiocaptype.
 /// When found, maps it into memory and returns virtual address, else None
 pub fn map_virtiocap(
-	bus: u8,
-	device: u8,
+	_bus: u8,
+	_device: u8,
 	adapter: &PciAdapter,
-	caplist: u32,
+	_caplist: u32,
 	virtiocaptype: u32,
 ) -> Option<(VirtAddr, u32)> {
-	let mut nextcaplist = caplist;
-	if nextcaplist < 0x40 {
-		error!(
-			"Caplist inside header! Offset: 0x{:x}, Aborting",
-			nextcaplist
-		);
-		return None;
-	}
+	let cap = find_virtiocap(adapter, virtiocaptype, None).unwrap();
 
-	// Debug dump all
-	/*for x in (0..255).step_by(4) {
-			debug!("{:02x}: {:08x}", x, pci::read_config(bus, device, x));
-	}*/
-
-	// Loop through capabilities until vendor (virtio) defined one is found
-	let virtiocapoffset = loop {
-		if nextcaplist == 0 || nextcaplist < 0x40 {
-			error!("Next caplist invalid, and still not found the wanted virtio cap, aborting!");
-			return None;
-		}
-		let captypeword = pci::read_config(bus, device, nextcaplist);
-		debug!(
-			"Read cap at offset 0x{:x}: captype 0x{:x}",
-			nextcaplist, captypeword
-		);
-		let captype = captypeword & 0xFF; // pci cap type
-		if captype == pci::PCI_CAP_ID_VNDR {
-			// we are vendor defined, with virtio vendor --> we can check for virtio cap type
-			debug!("found vendor, virtio type: {}", (captypeword >> 24) & 0xFF);
-			if (captypeword >> 24) & 0xFF == virtiocaptype {
-				break nextcaplist;
-			}
-		}
-		nextcaplist = (captypeword >> 8) & 0xFF; // pci cap next ptr
-	};
 	// Since we have verified caplistoffset to be virtio_pci_cap common config, read fields.
 	// TODO: cleanup 'hacky' type conversions
-	let baridx: u8 = (pci::read_config(bus, device, virtiocapoffset + 4) & 0xFF) as u8; // get offset_of!(virtio_pci_cap, bar)
-	let offset: usize = pci::read_config(bus, device, virtiocapoffset + 8) as usize; // get offset_of!(virtio_pci_cap, offset)
-	let length: usize = pci::read_config(bus, device, virtiocapoffset + 12) as usize; // get offset_of!(virtio_pci_cap, length)
-	debug!(
+	let baridx: u8 = (cap.read_offset(4) & 0xFF) as u8; // get offset_of!(virtio_pci_cap, bar)
+	let offset: usize = cap.read_offset(8) as usize; // get offset_of!(virtio_pci_cap, offset)
+	let length: usize = cap.read_offset(12) as usize; // get offset_of!(virtio_pci_cap, length)
+	info!(
 		"Found virtio config bar as 0x{:x}, offset 0x{:x}, length 0x{:x}",
 		baridx, offset, length
 	);
@@ -808,7 +861,7 @@ pub fn map_virtiocap(
 		}
 
 		if virtiocaptype == VIRTIO_PCI_CAP_NOTIFY_CFG {
-			let notify_off_multiplier: u32 = pci::read_config(bus, device, virtiocapoffset + 16); // get offset_of!(virtio_pci_notify_cap, notify_off_multiplier)
+			let notify_off_multiplier: u32 = cap.read_offset(16); // get offset_of!(virtio_pci_notify_cap, notify_off_multiplier)
 			Some((virtualcapaddr, notify_off_multiplier))
 		} else {
 			Some((virtualcapaddr, 0))
@@ -835,7 +888,7 @@ pub fn init_virtio_device(adapter: &pci::PciAdapter) {
 						PciNetworkControllerSubclass::EthernetController => {
 							// TODO: proper error handling on driver creation fail
 							let drv = virtio_net::create_virtionet_driver(adapter).unwrap();
-							pci::register_driver(PciDriver::VirtioNet(SpinlockIrqSave::new(drv)));
+							pci::register_driver(PciDriver::VirtioNet(drv));
 						}
 						_ => {
 							warn!("Virtio device is NOT supported, skipping!");
@@ -853,8 +906,7 @@ pub fn init_virtio_device(adapter: &pci::PciAdapter) {
 			info!("Found Virtio-FS device!");
 			// TODO: check subclass
 			// TODO: proper error handling on driver creation fail
-			let drv = virtio_fs::create_virtiofs_driver(adapter).unwrap();
-			pci::register_driver(PciDriver::VirtioFs(SpinlockIrqSave::new(drv)));
+			virtio_fs::create_virtiofs_driver(adapter).unwrap();
 		}
 		_ => {
 			warn!("Virtio device is NOT supported, skipping!");
@@ -880,7 +932,7 @@ extern "x86-interrupt" fn virtio_irqhandler(_stack_frame: &mut ExceptionStackFra
 	increment_irq_counter((32 + unsafe { VIRTIO_IRQ_NO }).into());
 
 	let check_scheduler = match get_network_driver() {
-		Some(driver) => driver.lock().handle_interrupt(),
+		Some(driver) => driver.borrow_mut().handle_interrupt(),
 		_ => false,
 	};
 

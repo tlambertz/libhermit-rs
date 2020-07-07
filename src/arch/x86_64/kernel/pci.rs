@@ -46,7 +46,7 @@ pub const PCI_IO_BASE_ADDRESS_MASK: u32 = 0xFFFF_FFFC;
 pub const PCI_HEADER_TYPE_MASK: u32 = 0x007F_0000;
 pub const PCI_MULTIFUNCTION_MASK: u32 = 0x0080_0000;
 
-pub const PCI_CAP_ID_VNDR: u32 = 0x09;
+pub const PCI_CAP_ID_VNDR: u8 = 0x09;
 
 static mut PCI_ADAPTERS: Vec<PciAdapter> = Vec::new();
 static mut PCI_DRIVERS: Vec<PciDriver> = Vec::new();
@@ -121,6 +121,21 @@ pub struct MemoryBar {
 	pub size: usize,
 	pub width: u8, // 32 or 64 bit
 	pub prefetchable: bool,
+}
+
+pub struct PciCapability<'a> {
+	adapter: &'a PciAdapter,
+	capoffset: u32,
+}
+
+impl<'a> PciCapability<'a> {
+	pub fn read_offset(&self, offset: u32) -> u32 {
+		read_config(
+			self.adapter.bus,
+			self.adapter.device,
+			self.capoffset + offset,
+		)
+	}
 }
 
 pub enum PciDriver<'a> {
@@ -322,6 +337,63 @@ impl PciAdapter {
 			}
 		}
 		None
+	}
+
+	/// Loops through the capability list, calling given closure on each matching capability with type captype
+	/// If captype is none, called on all capabilites
+	/// loops until closure returns Some(), which is then returned.
+	pub fn scan_capabilities<'a, T>(
+		&'a self,
+		captype: Option<u8>,
+		f: &mut impl FnMut(PciCapability<'a>) -> Option<T>,
+	) -> Option<T> {
+		let caplist = read_config(self.bus, self.device, PCI_CAPABILITY_LIST_REGISTER) & 0xFF;
+		let mut nextcaplist = caplist;
+		if nextcaplist < 0x40 {
+			error!(
+				"Caplist inside header! Offset: 0x{:x}, Aborting",
+				nextcaplist
+			);
+			return None;
+		}
+
+		// Debug dump all
+		/*for x in (0..255).step_by(4) {
+				debug!("{:02x}: {:08x}", x, pci::read_config(bus, device, x));
+		}*/
+
+		// Loop through capabilities. For each captype, call closure
+		loop {
+			if nextcaplist == 0 || nextcaplist < 0x40 {
+				debug!("COuld not find wanted pci capability!");
+				return None;
+			}
+			let captypeword = read_config(self.bus, self.device, nextcaplist);
+			debug!(
+				"Read cap at offset 0x{:x}: captype 0x{:x}",
+				nextcaplist, captypeword
+			);
+
+			// If we have a capability, skip non-matching ones
+			let capt = (captypeword & 0xFF) as u8; // pci cap type
+			if let Some(captype) = captype {
+				if captype != capt {
+					nextcaplist = (captypeword >> 8) & 0xFC; // pci cap next ptr
+					continue;
+				}
+			}
+
+			let cap = PciCapability {
+				adapter: self,
+				capoffset: nextcaplist,
+			};
+			let res = f(cap);
+			if let Some(val) = res {
+				return Some(val);
+			}
+
+			nextcaplist = (captypeword >> 8) & 0xFC; // pci cap next ptr
+		}
 	}
 
 	/// Memory maps pci bar with specified index to identical location in virtual memory.
