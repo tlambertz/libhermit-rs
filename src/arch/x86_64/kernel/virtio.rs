@@ -710,6 +710,12 @@ pub struct VirtioNotification {
 	pub notify_off_multiplier: u32,
 }
 
+#[derive(Debug)]
+pub struct VirtioSharedMemory {
+	pub addr: *mut usize,
+	pub len: u64,
+}
+
 impl VirtioNotification {
 	pub fn get_notify_addr(&self, queue_notify_off: u32) -> &'static mut u16 {
 		// divide by 2 since notification_ptr is a u16 pointer but we have byte offset
@@ -724,12 +730,6 @@ impl VirtioNotification {
 		);
 		addr
 	}
-}
-
-#[repr(C)]
-pub struct virtio_shm_region {
-	pub addr: *mut u64,
-	pub len: u64,
 }
 
 pub fn find_virtiocap(
@@ -791,11 +791,16 @@ pub fn map_cap(adapter: &pci::PciAdapter, cap: &pci::PciCapability) -> Option<(u
 	}
 }
 
-pub fn get_shm_config(adapter: &PciAdapter, shm_id: u8) -> Option<(usize, usize)> {
+pub fn get_shm_config(adapter: &PciAdapter, shm_id: u8) -> Option<VirtioSharedMemory> {
 	let cap = find_virtiocap(adapter, VIRTIO_PCI_CAP_SHARED_MEMORY_CFG, Some(shm_id)).unwrap();
-	let mapped = map_cap(adapter, &cap);
-
-	mapped
+	if let Some((addr, len)) = map_cap(adapter, &cap) {
+		Some(VirtioSharedMemory {
+			addr: addr as *mut usize,
+			len: len as u64,
+		})
+	} else {
+		None
+	}
 }
 
 pub fn get_notify_config(adapter: &pci::PciAdapter) -> Option<VirtioNotification> {
