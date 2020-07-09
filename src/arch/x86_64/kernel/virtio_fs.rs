@@ -8,11 +8,12 @@
 use crate::arch::x86_64::kernel::fuse::{self, FuseInterface};
 use crate::arch::x86_64::kernel::pci;
 use crate::arch::x86_64::kernel::virtio::{
-	self, consts::*, virtio_pci_common_cfg, VirtioNotification, Virtq,
+	self, consts::*, virtio_pci_common_cfg, VirtioNotification, VirtioSharedMemory, Virtq,
 };
 use crate::syscalls::fs;
 use crate::util;
 
+use super::fuse_dax::DaxAllocator;
 use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
@@ -44,6 +45,7 @@ pub struct VirtioFsDriver<'a> {
 	common_cfg: &'a mut virtio_pci_common_cfg,
 	device_cfg: &'a virtio_fs_config,
 	notify_cfg: VirtioNotification,
+	shm_cfg: Option<VirtioSharedMemory>,
 	vqueues: Option<Vec<Virtq<'a>>>,
 }
 
@@ -290,8 +292,8 @@ pub fn create_virtiofs_driver(
 
 	let shm_cfg = virtio::get_shm_config(adapter, VIRTIO_FS_SHMCAP_ID_CACHE);
 
-	if let Some((addr, len)) = shm_cfg {
-		info!("Found Cache! Using DAX! {:x}, {:x}", addr, len);
+	if let Some(shm) = &shm_cfg {
+		info!("Found Cache! Using DAX! {:?}", shm);
 	} else {
 		info!("No Cache found, not using DAX!");
 	}
@@ -303,6 +305,7 @@ pub fn create_virtiofs_driver(
 		common_cfg,
 		device_cfg,
 		notify_cfg,
+		shm_cfg,
 		vqueues: None,
 	}));
 
@@ -311,7 +314,14 @@ pub fn create_virtiofs_driver(
 	trace!("Driver after init: {:?}", drv);
 
 	// Instanciate global fuse object
-	let fuse = fuse::Fuse::new(drv.clone());
+	let fuse = if let Some(shm) = &drv.borrow().shm_cfg {
+		info!("Found Cache! Using DAX! {:?}", shm);
+		let dax_allocator = DaxAllocator::new(shm.addr as u64, shm.len);
+		fuse::Fuse::new_with_dax(drv.clone(), dax_allocator)
+	} else {
+		info!("No Cache found, not using DAX!");
+		fuse::Fuse::new(drv.clone())
+	};
 
 	// send FUSE_INIT to create session
 	fuse.send_init();

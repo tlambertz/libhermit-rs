@@ -5,6 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
+use super::fuse_dax::{CacheEntry, DaxAllocator, FuseDaxCache, FUSE_DAX_MEM_RANGE_SZ};
 use crate::syscalls::fs::{FileError, FilePerms, PosixFile, PosixFileSystem, SeekWhence};
 use alloc::boxed::Box;
 use alloc::rc::Rc;
@@ -29,34 +30,34 @@ pub trait FuseInterface {
 
 pub struct Fuse<T: FuseInterface> {
 	driver: Rc<RefCell<T>>,
+	dax_allocator: Option<Rc<RefCell<DaxAllocator>>>,
 }
 
 impl<T: FuseInterface + 'static> PosixFileSystem for Fuse<T> {
 	fn open(&self, path: &str, perms: FilePerms) -> Result<Box<dyn PosixFile>, FileError> {
-		let mut file = FuseFile {
-			driver: self.driver.clone(),
-			fuse_nid: None,
-			fuse_fh: None,
-			offset: 0,
-		};
 		// 1.FUSE_INIT to create session
 		// Already done
+		let fuse_nid;
+		let fuse_fh;
+		let fuse_attr;
 
 		// Differentiate between opening and creating new file, since fuse does not support O_CREAT on open.
 		if !perms.creat {
 			// 2.FUSE_LOOKUP(FUSE_ROOT_ID, “foo”) -> nodeid
-			file.fuse_nid = self.lookup(path);
+			let entry = self.lookup(path);
 
-			if file.fuse_nid == None {
+			if let Some(entry) = entry {
+				fuse_nid = entry.nodeid;
+				fuse_attr = entry.attr;
+			} else {
 				warn!("Fuse lookup seems to have failed!");
 				return Err(FileError::ENOENT());
 			}
-
 			// 3.FUSE_OPEN(nodeid, O_RDONLY) -> fh
-			let (cmd, rsp) = create_open(file.fuse_nid.unwrap(), perms.raw);
+			let (cmd, rsp) = create_open(fuse_nid, perms.raw);
 			let rsp = self.driver.borrow_mut().send_command(cmd, Some(rsp));
 			trace!("Open answer {:?}", rsp);
-			file.fuse_fh = Some(rsp.unwrap().rsp.fh);
+			fuse_fh = Some(rsp.unwrap().rsp.fh);
 		} else {
 			// Create file (opens implicitly, returns results from both lookup and open calls)
 			let (cmd, rsp) = create_create(path, perms.raw, perms.mode);
@@ -67,10 +68,23 @@ impl<T: FuseInterface + 'static> PosixFileSystem for Fuse<T> {
 				.unwrap();
 			trace!("Create answer {:?}", rsp);
 
-			file.fuse_nid = Some(rsp.rsp.entry.nodeid);
-			file.fuse_fh = Some(rsp.rsp.open.fh);
+			fuse_nid = rsp.rsp.entry.nodeid;
+			fuse_fh = Some(rsp.rsp.open.fh);
+			fuse_attr = rsp.rsp.entry.attr;
 		}
 
+		let file = FuseFile {
+			driver: self.driver.clone(),
+			fuse_nid: Some(fuse_nid),
+			fuse_fh,
+			offset: 0,
+			dax_cache: self
+				.dax_allocator
+				.as_ref()
+				.map(|a| FuseDaxCache::new(a.clone())),
+			attr: fuse_attr,
+			open_options: perms,
+		};
 		Ok(Box::new(file))
 	}
 
@@ -85,7 +99,17 @@ impl<T: FuseInterface + 'static> PosixFileSystem for Fuse<T> {
 
 impl<T: FuseInterface + 'static> Fuse<T> {
 	pub fn new(driver: Rc<RefCell<T>>) -> Self {
-		Self { driver }
+		Self {
+			driver,
+			dax_allocator: None,
+		}
+	}
+
+	pub fn new_with_dax(driver: Rc<RefCell<T>>, dax_allocator: DaxAllocator) -> Self {
+		Self {
+			driver,
+			dax_allocator: Some(Rc::new(RefCell::new(dax_allocator))),
+		}
 	}
 
 	pub fn send_init(&self) {
@@ -94,10 +118,10 @@ impl<T: FuseInterface + 'static> Fuse<T> {
 		trace!("fuse init answer: {:?}", rsp);
 	}
 
-	pub fn lookup(&self, name: &str) -> Option<u64> {
+	pub fn lookup(&self, name: &str) -> Option<fuse_entry_out> {
 		let (cmd, rsp) = create_lookup(name);
 		let rsp = self.driver.borrow_mut().send_command(cmd, Some(rsp));
-		Some(rsp.unwrap().rsp.nodeid)
+		Some(rsp.unwrap().rsp)
 	}
 }
 
@@ -106,17 +130,14 @@ struct FuseFile<T: FuseInterface> {
 	fuse_nid: Option<u64>,
 	fuse_fh: Option<u64>,
 	offset: usize,
+	dax_cache: Option<FuseDaxCache>,
+	attr: fuse_attr,
+	open_options: FilePerms,
 }
 
-impl<T: FuseInterface> PosixFile for FuseFile<T> {
-	fn close(&mut self) -> Result<(), FileError> {
-		let (cmd, rsp) = create_release(self.fuse_nid.unwrap(), self.fuse_fh.unwrap());
-		self.driver.borrow_mut().send_command(cmd, Some(rsp));
-
-		Ok(())
-	}
-
-	fn read(&mut self, len: u32) -> Result<Vec<u8>, FileError> {
+impl<T: FuseInterface> FuseFile<T> {
+	/// Reads the file using normal fuse read commands. File contents are in fuse reply
+	fn read_fuse(&mut self, len: u32) -> Result<Vec<u8>, FileError> {
 		let mut len = len;
 		if len as usize > MAX_READ_LEN {
 			debug!("Reading longer than max_read_len: {}", len);
@@ -139,8 +160,40 @@ impl<T: FuseInterface> PosixFile for FuseFile<T> {
 		}
 	}
 
-	fn write(&mut self, buf: &[u8]) -> Result<u64, FileError> {
-		debug!("fuse write!");
+	/// Uses fuse setupmapping to create a DAX mapping, and copies from that. Mappings are cached
+	fn read_dax(&mut self, len: u32) -> Result<Vec<u8>, FileError> {
+		trace!("read_dax({:x}) from offset {:x}", len, self.offset);
+		let mut cached = self.get_cached()?.clone();
+		let cached = cached.as_buf(self.offset as u64);
+
+		// Limit read length to buffer boundary
+		let mut len = len as usize;
+		if cached.len() < len {
+			len = cached.len();
+		}
+
+		// Limit length to file size
+		if self.offset + len > self.attr.size as usize {
+			trace!(
+				"Limiting file read over EOF: {}, {}, {}",
+				self.offset,
+				len,
+				self.attr.size
+			);
+			len = self.attr.size as usize - self.offset;
+		}
+
+		self.offset += len;
+
+		// Copy buffer into output.
+		// TODO: zerocopy?
+		let mut vec = cached[..len].to_vec();
+		vec.truncate(len);
+		trace!("read_dax output: {:?}", vec);
+		Ok(vec)
+	}
+
+	fn write_fuse(&mut self, buf: &[u8]) -> Result<u64, FileError> {
 		let mut len = buf.len();
 		if len as usize > MAX_WRITE_LEN {
 			debug!(
@@ -158,11 +211,130 @@ impl<T: FuseInterface> PosixFile for FuseFile<T> {
 
 			let len = rsp.rsp.size as usize;
 			self.offset += len;
+
+			// Update file size if needed
+			if self.offset > self.attr.size as usize {
+				trace!(
+					"File-extending write, updating size!: {}, {}, {}",
+					self.offset,
+					len,
+					self.attr.size
+				);
+				self.attr.size = self.offset as u64;
+			}
 			debug!("Written {} bytes", len);
 			Ok(len as u64)
 		} else {
 			warn!("File not open, cannot read!");
 			Err(FileError::ENOENT())
+		}
+	}
+
+	fn write_dax(&mut self, buf: &[u8]) -> Result<u64, FileError> {
+		let mut len = buf.len() as usize;
+
+		trace!("write_dax({:x}) from offset {:x}", len, self.offset);
+
+		// If write is file-extending, fall back to write_fuse()
+		if self.offset + len > self.attr.size as usize {
+			trace!(
+				"File-extending write, fallback to fuse write: {}, {}, {}",
+				self.offset,
+				len,
+				self.attr.size
+			);
+			return self.write_fuse(buf);
+		}
+
+		let mut cached = self.get_cached()?.clone();
+		let cached = cached.as_buf(self.offset as u64);
+
+		// Limit write length to buffer boundary
+		if cached.len() < len {
+			len = cached.len();
+		}
+
+		self.offset += len;
+
+		// Write buffer into cache.
+		cached[..len].copy_from_slice(buf);
+
+		Ok(len as u64)
+	}
+
+	/// Returns true if the file is opened with write flag and anyone (owner/group/public) has write permissions
+	fn writable(&self) -> bool {
+		self.open_options.write && self.attr.mode & 0o222 > 0
+	}
+
+	fn get_cached(&mut self) -> Result<CacheEntry, FileError> {
+		let cache = self.dax_cache.as_mut().unwrap();
+		if let Some(entry) = cache.get_cached(self.offset as u64) {
+			// Offset is already mapped, fast path!
+			trace!("Already cached dax, fast path. {:?}", entry);
+			return Ok(entry);
+		}
+
+		// Offset is not yet mapped, do it now!
+		let entry = cache
+			.alloc_cache(self.offset as u64)
+			.expect("Could not alloc DAX cache"); // TODO: free cache entry, try again
+		if let Some(fh) = self.fuse_fh {
+			let mut flags = FUSE_SETUPMAPPING_FLAG_READ;
+			if self.writable() {
+				flags |= FUSE_SETUPMAPPING_FLAG_WRITE;
+			}
+			let (cmd, rsp) = create_setupmapping(
+				fh,
+				self.offset as u64,
+				FUSE_DAX_MEM_RANGE_SZ as u64,
+				flags,
+				entry.get_moffset(),
+			);
+			let rsp = self.driver.borrow_mut().send_command(cmd, Some(rsp));
+			// TODO: check for errors. mapping might have failed.
+			Ok(entry)
+		} else {
+			warn!("File not open, cannot read_dax!");
+			Err(FileError::ENOENT())
+		}
+	}
+
+	/// Drops all DAX mappings
+	fn drop_cache(&mut self) {
+		if let Some(cache) = &mut self.dax_cache {
+			// moffset = 0 and length = 0 --> Remove all mappings
+			let (cmd, rsp) = create_removemapping(self.fuse_nid.unwrap_or(0), 0, 0);
+			let rsp = self.driver.borrow_mut().send_command(cmd, Some(rsp));
+
+			cache.free();
+		}
+	}
+}
+
+impl<T: FuseInterface> PosixFile for FuseFile<T> {
+	fn close(&mut self) -> Result<(), FileError> {
+		self.drop_cache();
+		let (cmd, rsp) = create_release(self.fuse_nid.unwrap(), self.fuse_fh.unwrap());
+		self.driver.borrow_mut().send_command(cmd, Some(rsp));
+
+		Ok(())
+	}
+
+	fn read(&mut self, len: u32) -> Result<Vec<u8>, FileError> {
+		if self.dax_cache.is_some() {
+			self.read_dax(len)
+		} else {
+			self.read_fuse(len)
+		}
+	}
+
+	fn write(&mut self, buf: &[u8]) -> Result<u64, FileError> {
+		debug!("fuse write!");
+		if self.dax_cache.is_some() {
+			self.write_dax(buf)
+		} else {
+			self.write_fuse(buf)
 		}
 	}
 
@@ -224,6 +396,9 @@ pub enum Opcode {
 	FUSE_NOTIFY_REPLY = 41,
 	FUSE_BATCH_FORGET = 42,
 	FUSE_FALLOCATE = 43,
+
+	FUSE_SETUPMAPPING = 48,
+	FUSE_REMOVEMAPPING = 49,
 
 	FUSE_SETVOLNAME = 61,
 	FUSE_GETXTIMES = 62,
@@ -681,7 +856,7 @@ pub struct fuse_attr {
 	pub atimensec: u32,
 	pub mtimensec: u32,
 	pub ctimensec: u32,
-	pub mode: u32,
+	pub mode: u32, // eg 0o100644
 	pub nlink: u32,
 	pub uid: u32,
 	pub gid: u32,
@@ -786,6 +961,103 @@ pub fn create_create(
 	let cmd = fuse_create_in::new(path, flags, mode);
 	let mut cmdhdr = create_in_header::<fuse_create_in>(Opcode::FUSE_CREATE);
 	cmdhdr.nodeid = FUSE_ROOT_ID;
+	let rsp = Default::default();
+	let rsphdr = Default::default();
+	(
+		Cmd {
+			cmd,
+			header: cmdhdr,
+			extra_buffer: None,
+		},
+		Rsp {
+			rsp,
+			header: rsphdr,
+			extra_buffer: None,
+		},
+	)
+}
+
+pub const FUSE_SETUPMAPPING_ENTRIES: u64 = 8;
+pub const FUSE_SETUPMAPPING_FLAG_WRITE: u64 = 1 << 0;
+pub const FUSE_SETUPMAPPING_FLAG_READ: u64 = 1 << 1;
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct fuse_setupmapping_in {
+	pub fh: u64,
+	pub foffset: u64,
+	pub len: u64,
+	pub flags: u64,
+	pub moffset: u64,
+}
+unsafe impl FuseIn for fuse_setupmapping_in {}
+
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct fuse_setupmapping_out {
+	pub something1: [u8; 32],
+	pub something2: [u8; 32],
+	pub something3: [u8; 32],
+}
+unsafe impl FuseOut for fuse_setupmapping_out {}
+
+pub fn create_setupmapping(
+	fh: u64,
+	foffset: u64,
+	len: u64,
+	flags: u64,
+	moffset: u64,
+) -> (Cmd<fuse_setupmapping_in>, Rsp<fuse_setupmapping_out>) {
+	let cmd: fuse_setupmapping_in = fuse_setupmapping_in {
+		fh,
+		foffset,
+		len,
+		flags,
+		moffset,
+	};
+	let mut cmdhdr = create_in_header::<fuse_setupmapping_in>(Opcode::FUSE_SETUPMAPPING);
+	cmdhdr.nodeid = core::u64::MAX; // -1
+	let rsp = Default::default();
+	let rsphdr = Default::default();
+	(
+		Cmd {
+			cmd,
+			header: cmdhdr,
+			extra_buffer: None,
+		},
+		Rsp {
+			rsp,
+			header: rsphdr,
+			extra_buffer: None,
+		},
+	)
+}
+
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct fuse_removemapping_in {
+	pub count: u64,   // Currently only 1 supported.
+	pub moffset: u64, // fuse_removemapping_one
+	pub len: u64,     // fuse_removemapping_one
+}
+unsafe impl FuseIn for fuse_removemapping_in {}
+
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct fuse_removemapping_out {}
+unsafe impl FuseOut for fuse_removemapping_out {}
+
+pub fn create_removemapping(
+	nid: u64,
+	moffset: u64,
+	len: u64,
+) -> (Cmd<fuse_removemapping_in>, Rsp<fuse_removemapping_out>) {
+	let cmd: fuse_removemapping_in = fuse_removemapping_in {
+		count: 1,
+		moffset,
+		len,
+	};
+	let mut cmdhdr = create_in_header::<fuse_removemapping_in>(Opcode::FUSE_REMOVEMAPPING);
+	cmdhdr.nodeid = nid;
 	let rsp = Default::default();
 	let rsphdr = Default::default();
 	(
