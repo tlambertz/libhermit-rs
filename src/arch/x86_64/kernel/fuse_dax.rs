@@ -12,6 +12,7 @@ pub struct DaxAllocator {
 
 impl DaxAllocator {
 	pub fn new(start: u64, size: u64) -> Self {
+		debug!("Creating Fuse Dax Allocator at {:x}, {:x}", start, size);
 		let count = size / FUSE_DAX_MEM_RANGE_SZ;
 		let ptr = start as *mut u8;
 		let free_stack = (0..count)
@@ -92,6 +93,14 @@ impl FuseDaxCache {
 		let file_offset = align_down!(file_offset, FUSE_DAX_MEM_RANGE_SZ);
 
 		let slab = self.allocator.borrow_mut().allocate()?;
+		{
+			trace!(
+				"Alloc'd slab for offset {} at {:p} [{:x}]",
+				file_offset,
+				slab.borrow().addr,
+				slab.borrow().moffset
+			);
+		}
 		let entry = CacheEntry { slab, file_offset };
 		self.entries.insert(file_offset as u64, entry.clone());
 		Ok(entry)

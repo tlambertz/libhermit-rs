@@ -257,14 +257,20 @@ impl<T: FuseInterface> FuseFile<T> {
 		self.offset += len;
 
 		// Write buffer into cache.
+		trace!(
+			"copying data to slice! from {:p} to {:p} of len {:x}",
+			buf.as_ptr(),
+			cached.as_ptr(),
+			len
+		);
 		cached[..len].copy_from_slice(buf);
 
 		Ok(len as u64)
 	}
 
-	/// Returns true if the file is opened with write flag and anyone (owner/group/public) has write permissions
+	/// Returns true if the file is opened with write flag
 	fn writable(&self) -> bool {
-		self.open_options.write && self.attr.mode & 0o222 > 0
+		self.open_options.write // && self.attr.mode & 0o222 > 0
 	}
 
 	fn get_cached(&mut self) -> Result<CacheEntry, FileError> {
@@ -304,7 +310,8 @@ impl<T: FuseInterface> FuseFile<T> {
 	fn drop_cache(&mut self) {
 		if let Some(cache) = &mut self.dax_cache {
 			// moffset = 0 and length = 0 --> Remove all mappings
-			let (cmd, rsp) = create_removemapping(self.fuse_nid.unwrap_or(0), 0, 0);
+			let drop_all = 0xffffffffffffffff; // ~(uint64_t)0
+			let (cmd, rsp) = create_removemapping(self.fuse_nid.unwrap_or(0), 0, drop_all);
 			let rsp = self.driver.borrow_mut().send_command(cmd, Some(rsp));
 
 			cache.free();
@@ -1032,10 +1039,10 @@ pub fn create_setupmapping(
 	)
 }
 
-#[repr(C)]
-#[derive(Debug, Default)]
+#[repr(C, packed)]
+#[derive(Debug, Default, Copy, Clone)]
 pub struct fuse_removemapping_in {
-	pub count: u64,   // Currently only 1 supported.
+	pub count: u32,   // Currently only 1 supported.
 	pub moffset: u64, // fuse_removemapping_one
 	pub len: u64,     // fuse_removemapping_one
 }
