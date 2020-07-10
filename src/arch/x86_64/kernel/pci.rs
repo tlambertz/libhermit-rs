@@ -352,7 +352,7 @@ impl PciAdapter {
 		// Loop through capabilities. For each captype, call closure
 		loop {
 			if nextcaplist == 0 || nextcaplist < 0x40 {
-				debug!("COuld not find wanted pci capability!");
+				debug!("Could not find wanted pci capability {:?}!", captype);
 				return None;
 			}
 			let captypeword = read_config(self.bus, self.device, nextcaplist);
