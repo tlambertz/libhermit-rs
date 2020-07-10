@@ -736,34 +736,41 @@ pub fn find_virtiocap(
 	adapter: &PciAdapter,
 	virtiocaptype: u32,
 	id: Option<u8>,
-) -> Option<pci::PciCapability> {
-	adapter.scan_capabilities(
-		Some(pci::PCI_CAP_ID_VNDR),
-		&mut |cap: pci::PciCapability| -> Option<pci::PciCapability> {
-			// we are vendor defined, with virtio vendor --> we can check for virtio cap type
-			let captypeword = cap.read_offset(0);
-			let captype = (captypeword >> 24) & 0xFF;
-			debug!("found vendor, virtio type: {}", captype);
-			if captype == virtiocaptype {
-				// Type matches, now check ID if given
-				if let Some(tid) = id {
-					let cid: u8 = ((cap.read_offset(4) >> 8) & 0xFF) as u8; // get offset_of!(virtio_pci_cap, id)
-					if cid == tid {
-						// cap and id match, return cap
+) -> Result<pci::PciCapability, ()> {
+	debug!(
+		"Searching for virtio capability {:?} {:?}",
+		virtiocaptype, id
+	);
+	adapter
+		.scan_capabilities(
+			Some(pci::PCI_CAP_ID_VNDR),
+			&mut |cap: pci::PciCapability| -> Option<pci::PciCapability> {
+				// we are vendor defined, with virtio vendor --> we can check for virtio cap type
+				let captypeword = cap.read_offset(0);
+				let captype = (captypeword >> 24) & 0xFF;
+				debug!("found vendor, virtio type: {}", captype);
+				if captype == virtiocaptype {
+					// Type matches, now check ID if given
+					if let Some(tid) = id {
+						let cid: u8 = ((cap.read_offset(4) >> 8) & 0xFF) as u8; // get offset_of!(virtio_pci_cap, id)
+						if cid == tid {
+							// cap and id match, return cap
+							return Some(cap);
+						}
+					} else {
+						// dont check ID, we have found cap
 						return Some(cap);
 					}
-				} else {
-					// dont check ID, we have found cap
-					return Some(cap);
 				}
-			}
-			None
-		},
-	)
+				trace!("Does not match virtio cap {:?} {:?}", virtiocaptype, id);
+				None
+			},
+		)
+		.ok_or(())
 }
 
 /// memory maps a pci capability
-pub fn map_cap(adapter: &pci::PciAdapter, cap: &pci::PciCapability) -> Option<(usize, usize)> {
+pub fn map_cap(adapter: &pci::PciAdapter, cap: &pci::PciCapability) -> Result<(usize, usize), ()> {
 	// TODO: assert this cap is virtiocap?
 	// TODO: cleanup 'hacky' type conversions
 
@@ -782,53 +789,45 @@ pub fn map_cap(adapter: &pci::PciAdapter, cap: &pci::PciCapability) -> Option<(u
 				size,
 				offset + length
 			);
-			return None;
+			return Err(());
 		}
 
-		Some((virtualcapaddr, length))
+		Ok((virtualcapaddr, length))
 	} else {
-		None
+		Err(())
 	}
 }
 
-pub fn get_shm_config(adapter: &PciAdapter, shm_id: u8) -> Option<VirtioSharedMemory> {
-	let cap = find_virtiocap(adapter, VIRTIO_PCI_CAP_SHARED_MEMORY_CFG, Some(shm_id)).unwrap();
-	if let Some((addr, len)) = map_cap(adapter, &cap) {
-		Some(VirtioSharedMemory {
-			addr: addr as *mut usize,
-			len: len as u64,
-		})
-	} else {
-		None
-	}
+pub fn get_shm_config(adapter: &PciAdapter, shm_id: u8) -> Result<VirtioSharedMemory, ()> {
+	let cap = find_virtiocap(adapter, VIRTIO_PCI_CAP_SHARED_MEMORY_CFG, Some(shm_id))?;
+	let (addr, len) = map_cap(adapter, &cap)?;
+
+	Ok(VirtioSharedMemory {
+		addr: addr as *mut usize,
+		len: len as u64,
+	})
 }
 
-pub fn get_notify_config(adapter: &pci::PciAdapter) -> Option<VirtioNotification> {
-	let cap = find_virtiocap(adapter, VIRTIO_PCI_CAP_NOTIFY_CFG, None).unwrap();
-	let mapped = map_cap(adapter, &cap);
+pub fn get_notify_config(adapter: &pci::PciAdapter) -> Result<VirtioNotification, ()> {
+	let cap = find_virtiocap(adapter, VIRTIO_PCI_CAP_NOTIFY_CFG, None)?;
+	let (addr, _length) = map_cap(adapter, &cap)?;
 
-	if let Some((addr, _length)) = mapped {
-		let notify_off_multiplier: u32 = cap.read_offset(16); // get offset_of!(virtio_pci_notify_cap, notify_off_multiplier)
-		let notify_cfg = VirtioNotification {
-			notification_ptr: addr as *mut u16,
-			notify_off_multiplier,
-		};
-		Some(notify_cfg)
-	} else {
-		None
-	}
+	let notify_off_multiplier: u32 = cap.read_offset(16); // get offset_of!(virtio_pci_notify_cap, notify_off_multiplier)
+	let notify_cfg = VirtioNotification {
+		notification_ptr: addr as *mut u16,
+		notify_off_multiplier,
+	};
+	Ok(notify_cfg)
 }
 
-pub fn get_common_config(adapter: &pci::PciAdapter) -> Option<&'static mut virtio_pci_common_cfg> {
-	let cap = find_virtiocap(adapter, VIRTIO_PCI_CAP_COMMON_CFG, None).unwrap();
-	let mapped = map_cap(adapter, &cap);
+pub fn get_common_config(
+	adapter: &pci::PciAdapter,
+) -> Result<&'static mut virtio_pci_common_cfg, ()> {
+	let cap = find_virtiocap(adapter, VIRTIO_PCI_CAP_COMMON_CFG, None)?;
+	let (addr, _length) = map_cap(adapter, &cap)?;
 
-	if let Some((addr, _length)) = mapped {
-		let cfg = unsafe { &mut *(addr as *mut virtio_pci_common_cfg) };
-		Some(cfg)
-	} else {
-		None
-	}
+	let cfg = unsafe { &mut *(addr as *mut virtio_pci_common_cfg) };
+	Ok(cfg)
 }
 
 /// Scans pci-capabilities for a virtio-capability of type virtiocaptype.

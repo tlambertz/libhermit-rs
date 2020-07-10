@@ -240,20 +240,16 @@ impl FuseInterface for VirtioFsDriver<'_> {
 	*/
 }
 
-fn get_device_config(adapter: &pci::PciAdapter) -> Option<&'static mut virtio_fs_config> {
+fn get_device_config(adapter: &pci::PciAdapter) -> Result<&'static mut virtio_fs_config, ()> {
 	let cap = virtio::find_virtiocap(adapter, VIRTIO_PCI_CAP_DEVICE_CFG, None).unwrap();
-	let mapped = virtio::map_cap(adapter, &cap);
+	let (cap_device_raw, _length) = virtio::map_cap(adapter, &cap)?;
 
-	if let Some((cap_device_raw, _length)) = mapped {
-		Some(unsafe { &mut *(cap_device_raw as *mut virtio_fs_config) })
-	} else {
-		None
-	}
+	Ok(unsafe { &mut *(cap_device_raw as *mut virtio_fs_config) })
 }
 
 pub fn create_virtiofs_driver(
 	adapter: &pci::PciAdapter,
-) -> Option<Rc<RefCell<VirtioFsDriver<'static>>>> {
+) -> Result<Rc<RefCell<VirtioFsDriver<'static>>>, ()> {
 	// Scan capabilities to get common config, which we need to reset the device and get basic info.
 	// also see https://elixir.bootlin.com/linux/latest/source/drivers/virtio/virtio_pci_modern.c#L581 (virtio_pci_modern_probe)
 	// Read status register
@@ -264,33 +260,33 @@ pub fn create_virtiofs_driver(
 	// non-legacy virtio device always specifies capability list, so it can tell us in which bar we find the virtio-config-space
 	if status & pci::PCI_STATUS_CAPABILITIES_LIST == 0 {
 		error!("Found virtio device without capability list. Likely legacy-device! Aborting.");
-		return None;
+		return Err(());
 	}
 
 	// get common config mapped, cast to virtio_pci_common_cfg
-	let common_cfg = if let Some(c) = virtio::get_common_config(adapter) {
+	let common_cfg = if let Some(c) = virtio::get_common_config(adapter).ok() {
 		c
 	} else {
 		error!("Could not find VIRTIO_PCI_CAP_COMMON_CFG. Aborting!");
-		return None;
+		return Err(());
 	};
 
 	// get device config mapped, cast to virtio_fs_config
-	let device_cfg = if let Some(d) = get_device_config(adapter) {
+	let device_cfg = if let Some(d) = get_device_config(adapter).ok() {
 		d
 	} else {
 		error!("Could not find VIRTIO_PCI_CAP_DEVICE_CFG. Aborting!");
-		return None;
+		return Err(());
 	};
 
-	let notify_cfg = if let Some(n) = virtio::get_notify_config(adapter) {
+	let notify_cfg = if let Some(n) = virtio::get_notify_config(adapter).ok() {
 		n
 	} else {
 		error!("Could not find VIRTIO_PCI_CAP_NOTIFY_CFG. Aborting!");
-		return None;
+		return Err(());
 	};
 
-	let shm_cfg = virtio::get_shm_config(adapter, VIRTIO_FS_SHMCAP_ID_CACHE);
+	let shm_cfg = virtio::get_shm_config(adapter, VIRTIO_FS_SHMCAP_ID_CACHE).ok();
 
 	if let Some(shm) = &shm_cfg {
 		info!("Found Cache! Using DAX! {:?}", shm);
@@ -332,5 +328,5 @@ pub fn create_virtiofs_driver(
 	fs.mount(tag, Box::new(fuse))
 		.expect("Mount failed. Duplicate tag?");
 
-	Some(drv)
+	Ok(drv)
 }
