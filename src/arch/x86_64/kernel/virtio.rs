@@ -765,7 +765,7 @@ pub fn find_virtiocap(
 }
 
 /// memory maps a pci capability
-pub fn map_cap(adapter: &pci::PciAdapter, cap: &pci::PciCapability) -> Result<(usize, usize), ()> {
+pub fn map_cap(adapter: &pci::PciAdapter, cap: &pci::PciCapability, no_cache: bool) -> Result<(usize, usize), ()> {
 	// TODO: assert this cap is virtiocap?
 	// TODO: cleanup 'hacky' type conversions
 
@@ -775,7 +775,7 @@ pub fn map_cap(adapter: &pci::PciAdapter, cap: &pci::PciCapability) -> Result<(u
 	let length: usize = cap.read_offset(12) as usize; // get offset_of!(virtio_pci_cap, length)
 
 	// corrosponding setup in eg Qemu @ https://github.com/qemu/qemu/blob/master/hw/virtio/virtio-pci.c#L1590 (virtio_pci_device_plugged)
-	if let Some((virtualbaraddr, size)) = adapter.memory_map_bar(baridx, true) {
+	if let Some((virtualbaraddr, size)) = adapter.memory_map_bar(baridx, no_cache) {
 		let virtualcapaddr = virtualbaraddr + offset;
 
 		if size < offset + length {
@@ -795,7 +795,7 @@ pub fn map_cap(adapter: &pci::PciAdapter, cap: &pci::PciCapability) -> Result<(u
 
 pub fn get_shm_config(adapter: &PciAdapter, shm_id: u8) -> Result<VirtioSharedMemory, ()> {
 	let cap = find_virtiocap(adapter, VIRTIO_PCI_CAP_SHARED_MEMORY_CFG, Some(shm_id))?;
-	let (addr, len) = map_cap(adapter, &cap)?;
+	let (addr, len) = map_cap(adapter, &cap, false)?;
 	
 	Ok(VirtioSharedMemory {
 			addr: addr as *mut usize,
@@ -805,7 +805,7 @@ pub fn get_shm_config(adapter: &PciAdapter, shm_id: u8) -> Result<VirtioSharedMe
 
 pub fn get_notify_config(adapter: &pci::PciAdapter) -> Result<VirtioNotification, ()> {
 	let cap = find_virtiocap(adapter, VIRTIO_PCI_CAP_NOTIFY_CFG, None)?;
-	let (addr, _length) = map_cap(adapter, &cap)?;
+	let (addr, _length) = map_cap(adapter, &cap, true)?;
 
 	let notify_off_multiplier: u32 = cap.read_offset(16); // get offset_of!(virtio_pci_notify_cap, notify_off_multiplier)
 	let notify_cfg = VirtioNotification {
@@ -817,7 +817,7 @@ pub fn get_notify_config(adapter: &pci::PciAdapter) -> Result<VirtioNotification
 
 pub fn get_common_config(adapter: &pci::PciAdapter) -> Result<&'static mut virtio_pci_common_cfg, ()> {
 	let cap = find_virtiocap(adapter, VIRTIO_PCI_CAP_COMMON_CFG, None)?;
-	let (addr, _length) = map_cap(adapter, &cap)?;
+	let (addr, _length) = map_cap(adapter, &cap, true)?;
 
 	let cfg = unsafe { &mut *(addr as *mut virtio_pci_common_cfg) };
 	Ok(cfg)
