@@ -242,7 +242,7 @@ impl FuseInterface for VirtioFsDriver<'_> {
 
 fn get_device_config(adapter: &pci::PciAdapter) -> Result<&'static mut virtio_fs_config, ()> {
 	let cap = virtio::find_virtiocap(adapter, VIRTIO_PCI_CAP_DEVICE_CFG, None).unwrap();
-	let (cap_device_raw, _length) = virtio::map_cap(adapter, &cap)?;
+	let (cap_device_raw, _length) = virtio::map_cap(adapter, &cap, true)?;
 
 	Ok(unsafe { &mut *(cap_device_raw as *mut virtio_fs_config) })
 }
