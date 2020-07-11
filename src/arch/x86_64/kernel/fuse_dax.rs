@@ -57,7 +57,7 @@ impl CacheEntry {
 	}
 
 	pub fn get_moffset(&self) -> u64 {
-		info!("{:x}", self.slab.borrow().moffset);
+		//info!("{:x}", self.slab.borrow().moffset);
 		self.slab.borrow().moffset
 	}
 }
@@ -107,7 +107,7 @@ impl FuseDaxCache {
 	}
 
 	/// Iterates over all cached entries an calls do_op(file_offset, buffer) on each.
-	pub fn iterate_run(&mut self, do_op: fn(&u64, &CacheEntry)) {
+	pub fn iterate_run(&mut self, mut do_op: impl FnMut(&u64, &CacheEntry)) {
 		for (addr, buf) in self.entries.iter() {
 			do_op(addr, buf);
 		}
