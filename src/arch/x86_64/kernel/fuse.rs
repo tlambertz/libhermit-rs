@@ -309,9 +309,18 @@ impl<T: FuseInterface> FuseFile<T> {
 	/// Drops all DAX mappings
 	fn drop_cache(&mut self) {
 		if let Some(cache) = &mut self.dax_cache {
-			// moffset = 0 and length = 0 --> Remove all mappings
-			let drop_all = 0xffffffffffffffff; // ~(uint64_t)0
-			let (cmd, rsp) = create_removemapping(self.fuse_nid.unwrap_or(0), 0, drop_all);
+			let mut mappings = Vec::new();
+			cache.iterate_run(|_addr, entry| {
+				mappings.push(fuse_removemapping_one {
+					moffset: entry.get_moffset(),
+					len: FUSE_DAX_MEM_RANGE_SZ,
+				})
+			});
+			if mappings.is_empty() {
+				return;
+			}
+			trace!("Removing dax mappings {:?}", mappings);
+			let (cmd, rsp) = create_removemapping(self.fuse_nid.unwrap_or(0), &mappings);
 			let rsp = self.driver.borrow_mut().send_command(cmd, Some(rsp));
 
 			cache.free();
@@ -456,6 +465,7 @@ impl<T> Cmd<T>
 where
 	T: FuseIn + core::fmt::Debug,
 {
+	// TODO: this is more like as_u8buf
 	pub fn to_u8buf(&self) -> Vec<&[u8]> {
 		let rawcmd = unsafe {
 			::core::slice::from_raw_parts(
@@ -1042,9 +1052,7 @@ pub fn create_setupmapping(
 #[repr(C, packed)]
 #[derive(Debug, Default, Copy, Clone)]
 pub struct fuse_removemapping_in {
-	pub count: u32,   // Currently only 1 supported.
-	pub moffset: u64, // fuse_removemapping_one
-	pub len: u64,     // fuse_removemapping_one
+	pub count: u32,
 }
 unsafe impl FuseIn for fuse_removemapping_in {}
 
@@ -1053,25 +1061,37 @@ unsafe impl FuseIn for fuse_removemapping_in {}
 pub struct fuse_removemapping_out {}
 unsafe impl FuseOut for fuse_removemapping_out {}
 
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct fuse_removemapping_one {
+	pub moffset: u64,
+	pub len: u64,
+}
+
 pub fn create_removemapping(
 	nid: u64,
-	moffset: u64,
-	len: u64,
+	mappings: &Vec<fuse_removemapping_one>,
 ) -> (Cmd<fuse_removemapping_in>, Rsp<fuse_removemapping_out>) {
 	let cmd: fuse_removemapping_in = fuse_removemapping_in {
-		count: 1,
-		moffset,
-		len,
+		count: mappings.len() as u32,
 	};
 	let mut cmdhdr = create_in_header::<fuse_removemapping_in>(Opcode::FUSE_REMOVEMAPPING);
 	cmdhdr.nodeid = nid;
 	let rsp = Default::default();
+
+	// Get u8buf of Vec
+	// TODO: create an interface that allows this without copying.
+	let byte_ptr = mappings.as_ptr() as *const u8;
+	let byte_len = mappings.len() * core::mem::size_of::<fuse_removemapping_one>();
+	let byte_arr = unsafe { core::slice::from_raw_parts(byte_ptr, byte_len) };
+	let extra = Vec::from(byte_arr);
+
 	let rsphdr = Default::default();
 	(
 		Cmd {
 			cmd,
 			header: cmdhdr,
-			extra_buffer: None,
+			extra_buffer: Some(extra),
 		},
 		Rsp {
 			rsp,
