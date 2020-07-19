@@ -17,6 +17,7 @@ use crate::arch;
 use crate::console;
 use crate::environment;
 use crate::errno::*;
+use crate::synch::spinlock::SpinlockIrqSave;
 use crate::syscalls::fs::{self, FilePerms, PosixFile, SeekWhence};
 use crate::util;
 
@@ -25,6 +26,8 @@ pub use self::uhyve::*;
 
 mod generic;
 mod uhyve;
+
+static DRIVER_LOCK: SpinlockIrqSave<()> = SpinlockIrqSave::new(());
 
 const SEEK_SET: i32 = 0;
 const SEEK_CUR: i32 = 1;
@@ -116,51 +119,65 @@ pub trait SyscallInterface: Send + Sync {
 	}
 
 	fn get_mac_address(&self) -> Result<[u8; 6], ()> {
+		let _lock = DRIVER_LOCK.lock();
+
 		match arch::kernel::pci::get_network_driver() {
-			Some(driver) => Ok(driver.lock().get_mac_address()),
+			Some(driver) => Ok(driver.borrow().get_mac_address()),
 			_ => Err(()),
 		}
 	}
 
 	fn get_mtu(&self) -> Result<u16, ()> {
+		let _lock = DRIVER_LOCK.lock();
+
 		match arch::kernel::pci::get_network_driver() {
-			Some(driver) => Ok(driver.lock().get_mtu()),
+			Some(driver) => Ok(driver.borrow().get_mtu()),
 			_ => Err(()),
 		}
 	}
 
 	fn has_packet(&self) -> bool {
+		let _lock = DRIVER_LOCK.lock();
+
 		match arch::kernel::pci::get_network_driver() {
-			Some(driver) => driver.lock().has_packet(),
+			Some(driver) => driver.borrow().has_packet(),
 			_ => false,
 		}
 	}
 
 	fn get_tx_buffer(&self, len: usize) -> Result<(*mut u8, usize), ()> {
+		let _lock = DRIVER_LOCK.lock();
+
 		match arch::kernel::pci::get_network_driver() {
-			Some(driver) => driver.lock().get_tx_buffer(len),
+			Some(driver) => driver.borrow_mut().get_tx_buffer(len),
 			_ => Err(()),
 		}
 	}
 
 	fn send_tx_buffer(&self, handle: usize, len: usize) -> Result<(), ()> {
+		let _lock = DRIVER_LOCK.lock();
+
 		match arch::kernel::pci::get_network_driver() {
-			Some(driver) => driver.lock().send_tx_buffer(handle, len),
+			Some(driver) => driver.borrow_mut().send_tx_buffer(handle, len),
 			_ => Err(()),
 		}
 	}
 
 	fn receive_rx_buffer(&self) -> Result<&'static [u8], ()> {
+		let _lock = DRIVER_LOCK.lock();
+
 		match arch::kernel::pci::get_network_driver() {
-			Some(driver) => driver.lock().receive_rx_buffer(),
+			Some(driver) => driver.borrow().receive_rx_buffer(),
 			_ => Err(()),
 		}
 	}
 
 	fn rx_buffer_consumed(&self) -> Result<(), ()> {
+		let _lock = DRIVER_LOCK.lock();
+
 		match arch::kernel::pci::get_network_driver() {
 			Some(driver) => {
-				driver.lock().rx_buffer_consumed();
+				driver.borrow_mut().rx_buffer_consumed();
 				Ok(())
 			}
 			_ => Err(()),
@@ -231,15 +248,13 @@ pub trait SyscallInterface: Send + Sync {
 	fn read(&self, fd: i32, buf: *mut u8, len: usize) -> isize {
 		debug!("Read! {}, {}", fd, len);
 
+		// TODO: assert that buf is valid in userspace
+		let buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+
 		let mut fs = fs::FILESYSTEM.lock();
 		let mut read_bytes = 0;
-		fs.fd_op(fd as u64, |file: &mut Box<dyn PosixFile + Send>| {
-			let dat = file.read(len as u32).unwrap(); // TODO: might fail
-
-			read_bytes = dat.len();
-			unsafe {
-				core::slice::from_raw_parts_mut(buf, read_bytes).copy_from_slice(&dat);
-			}
+		fs.fd_op(fd as u64, |file: &mut Box<dyn PosixFile>| {
+			read_bytes = file.read(buf).unwrap(); // TODO: might fail
 		});
 
 		read_bytes as isize
@@ -254,7 +269,7 @@ pub trait SyscallInterface: Send + Sync {
 
 			let mut written_bytes = 0;
 			let mut fs = fs::FILESYSTEM.lock();
-			fs.fd_op(fd as u64, |file: &mut Box<dyn PosixFile + Send>| {
+			fs.fd_op(fd as u64, |file: &mut Box<dyn PosixFile>| {
 				written_bytes = file.write(buf).unwrap(); // TODO: might fail
 			});
 			debug!("Write done! {}", written_bytes);
@@ -278,7 +293,7 @@ pub trait SyscallInterface: Send + Sync {
 
 		let mut fs = fs::FILESYSTEM.lock();
 		let mut ret = 0;
-		fs.fd_op(fd as u64, |file: &mut Box<dyn PosixFile + Send>| {
+		fs.fd_op(fd as u64, |file: &mut Box<dyn PosixFile>| {
 			ret = file.lseek(offset, whence.try_into().unwrap()).unwrap(); // TODO: might fail
 		});
 

@@ -190,7 +190,7 @@ pub trait PosixFileSystem {
 
 pub trait PosixFile {
 	fn close(&mut self) -> Result<(), FileError>;
-	fn read(&mut self, len: u32) -> Result<Vec<u8>, FileError>;
+	fn read(&mut self, buf: &mut [u8]) -> Result<u64, FileError>;
 	fn write(&mut self, buf: &[u8]) -> Result<u64, FileError>;
 	fn lseek(&mut self, offset: isize, whence: SeekWhence) -> Result<usize, FileError>;
 }

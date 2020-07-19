@@ -137,14 +137,14 @@ struct FuseFile<T: FuseInterface> {
 
 impl<T: FuseInterface> FuseFile<T> {
 	/// Reads the file using normal fuse read commands. File contents are in fuse reply
-	fn read_fuse(&mut self, len: u32) -> Result<Vec<u8>, FileError> {
-		let mut len = len;
+	fn read_fuse(&mut self, buf: &mut [u8]) -> Result<Vec<u8>, FileError> {
+		let mut len = buf.len();
 		if len as usize > MAX_READ_LEN {
 			debug!("Reading longer than max_read_len: {}", len);
-			len = MAX_READ_LEN as u32;
+			len = MAX_READ_LEN;
 		}
 		if let Some(fh) = self.fuse_fh {
-			let (cmd, rsp) = create_read(fh, len, self.offset as u64);
+			let (cmd, rsp) = create_read(fh, len as u32, self.offset as u64);
 			let rsp = self.driver.borrow_mut().send_command(cmd, Some(rsp));
 			let rsp = rsp.unwrap();
 			let len = rsp.header.len as usize - ::core::mem::size_of::<fuse_out_header>();
@@ -161,13 +161,13 @@ impl<T: FuseInterface> FuseFile<T> {
 	}
 
 	/// Uses fuse setupmapping to create a DAX mapping, and copies from that. Mappings are cached
-	fn read_dax(&mut self, len: u32) -> Result<Vec<u8>, FileError> {
-		trace!("read_dax({:x}) from offset {:x}", len, self.offset);
+	fn read_dax(&mut self, buf: &mut [u8]) -> Result<u64, FileError> {
+		trace!("read_dax({:x}) from offset {:x}", buf.len(), self.offset);
 		let mut cached = self.get_cached()?.clone();
 		let cached = cached.as_buf(self.offset as u64);
 
 		// Limit read length to buffer boundary
-		let mut len = len as usize;
+		let mut len = buf.len();
 		if cached.len() < len {
 			len = cached.len();
 		}
@@ -186,11 +186,11 @@ impl<T: FuseInterface> FuseFile<T> {
 		self.offset += len;
 
 		// Copy buffer into output.
-		// TODO: zerocopy?
-		let mut vec = cached[..len].to_vec();
-		vec.truncate(len);
-		trace!("read_dax output: {:?}", vec);
-		Ok(vec)
+		let read_bytes = len;
+		buf[..read_bytes].copy_from_slice(&cached[..len]);
+
+		trace!("read_dax output: {:?}", &buf[..read_bytes]);
+		Ok(read_bytes as u64)
 	}
 
 	fn write_fuse(&mut self, buf: &[u8]) -> Result<u64, FileError> {
@@ -301,7 +301,7 @@ impl<T: FuseInterface> FuseFile<T> {
 			// TODO: check for errors. mapping might have failed.
 			Ok(entry)
 		} else {
-			warn!("File not open, cannot read_dax!");
+			warn!("File not open, cannot use dax!");
 			Err(FileError::ENOENT())
 		}
 	}
@@ -337,11 +337,14 @@ impl<T: FuseInterface> PosixFile for FuseFile<T> {
 		Ok(())
 	}
 
-	fn read(&mut self, len: u32) -> Result<Vec<u8>, FileError> {
+	fn read(&mut self, buf: &mut [u8]) -> Result<u64, FileError> {
 		if self.dax_cache.is_some() {
-			self.read_dax(len)
+			self.read_dax(buf)
 		} else {
-			self.read_fuse(len)
+			let read = self.read_fuse(buf)?;
+			let read_bytes = read.len();
+			buf[..read_bytes].copy_from_slice(&read);
+			Ok(read_bytes as u64)
 		}
 	}
 
