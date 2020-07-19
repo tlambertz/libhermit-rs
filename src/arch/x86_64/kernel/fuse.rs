@@ -6,7 +6,7 @@
 // copied, modified, or distributed except according to those terms.
 
 use super::fuse_dax::{CacheEntry, DaxAllocator, FuseDaxCache, FUSE_DAX_MEM_RANGE_SZ};
-use crate::syscalls::fs::{FileError, FilePerms, PosixFile, PosixFileSystem, SeekWhence};
+use crate::syscalls::fs::{self, FileError, FilePerms, PosixFile, PosixFileSystem, SeekWhence};
 use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
@@ -94,6 +94,31 @@ impl<T: FuseInterface + 'static> PosixFileSystem for Fuse<T> {
 		trace!("unlink answer {:?}", rsp);
 
 		Ok(())
+	}
+
+	fn stat(&self, filename: &str) -> Result<fs::Stat, FileError> {
+		if let Some(feo) = self.lookup(filename) {
+			Ok(fs::Stat {
+				ino: feo.attr.ino,
+				size: feo.attr.size,
+				blocks: feo.attr.blocks,
+				atime: feo.attr.atime,
+				mtime: feo.attr.mtime,
+				ctime: feo.attr.ctime,
+				atimensec: feo.attr.atimensec,
+				mtimensec: feo.attr.mtimensec,
+				ctimensec: feo.attr.ctimensec,
+				mode: feo.attr.mode,
+				nlink: feo.attr.nlink,
+				uid: feo.attr.uid,
+				gid: feo.attr.gid,
+				rdev: feo.attr.rdev,
+				blksize: feo.attr.blksize,
+				padding: feo.attr.padding,
+			})
+		} else {
+			Err(FileError::ENOENT())
+		}
 	}
 }
 

@@ -145,6 +145,13 @@ impl Filesystem {
 		Ok(())
 	}
 
+	/// Stats a file given by path
+	pub fn stat(&mut self, path: &str) -> Result<Stat, FileError> {
+		debug!("Stat file {}", path);
+		let (fs, internal_path) = self.parse_path(path)?;
+		Ok(fs.stat(internal_path)?)
+	}
+
 	/// Create new backing-fs at mountpoint mntpath
 	pub fn mount(&mut self, mntpath: &str, mntobj: Box<dyn PosixFileSystem>) -> Result<(), ()> {
 		info!("Mounting {}", mntpath);
@@ -168,8 +175,8 @@ impl Filesystem {
 	}
 
 	/// Run closure on file referenced by file descriptor.
-	pub fn fd_op(&mut self, fd: u64, f: impl FnOnce(&mut Box<dyn PosixFile>)) {
-		f(self.files.get_mut(&fd).unwrap());
+	pub fn fd_op(&mut self, fd: u64, f: impl FnOnce(Option<&mut Box<dyn PosixFile>>)) {
+		f(self.files.get_mut(&fd));
 	}
 }
 
@@ -182,6 +189,7 @@ pub enum FileError {
 pub trait PosixFileSystem {
 	fn open(&self, _path: &str, _perms: FilePerms) -> Result<Box<dyn PosixFile>, FileError>;
 	fn unlink(&self, _path: &str) -> Result<(), FileError>;
+	fn stat(&self, path: &str) -> Result<Stat, FileError>;
 }
 
 pub trait PosixFile {
@@ -189,6 +197,27 @@ pub trait PosixFile {
 	fn read(&mut self, buf: &mut [u8]) -> Result<u64, FileError>;
 	fn write(&mut self, buf: &[u8]) -> Result<u64, FileError>;
 	fn lseek(&mut self, offset: isize, whence: SeekWhence) -> Result<usize, FileError>;
+}
+
+/// File stat. Currently 1:1 fuse stats
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Stat {
+		pub ino: u64,
+		pub size: u64,
+		pub blocks: u64,
+		pub atime: u64,
+		pub mtime: u64,
+		pub ctime: u64,
+		pub atimensec: u32,
+		pub mtimensec: u32,
+		pub ctimensec: u32,
+		pub mode: u32, // eg 0o100644
+		pub nlink: u32,
+		pub uid: u32,
+		pub gid: u32,
+		pub rdev: u32,
+		pub blksize: u32,
+		pub padding: u32,
 }
 
 // TODO: raw is partially redundant, create nicer interface
