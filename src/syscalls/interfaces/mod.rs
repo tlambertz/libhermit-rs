@@ -46,6 +46,34 @@ impl TryFrom<i32> for SeekWhence {
 	}
 }
 
+/// Stat object as passed by newlib
+// `gcc -g -c test.c && pahole test.o -C stat` outputs the following fields+sizes when using newlib
+// type resolution with `gcc -E test.c`
+// They are ordered in a way such that padding is not necessary
+#[repr(C, packed)]
+#[derive(Debug)]
+#[cfg(feature = "newlib")]
+struct stat {
+	st_dev: i16,      // dev_t
+	st_ino: u16,      // ino_t
+	st_mode: u32,     // mode_t
+	st_nlink: u16,    // nlink_t
+	st_uid: u16,      // uid_t
+	st_gid: u16,      // gid_t
+	st_rdev: i16,     // dev_t
+	st_size: i64,     // off_t
+	st_atime: i64,    // time_t
+	st_spare1: i64,   // long
+	st_mtime: i64,    // time_t
+	st_spare2: i64,   // long
+	st_ctime: i64,    // time_t
+	st_spare3: i64,   // long
+	st_blksize: i64,  // blksize_t
+	st_blocks: i64,   // blkcnt_t
+	st_spare4_0: i64, // long
+	st_spare4_1: i64, // long
+}
+
 // TODO: these are defined in hermit-abi. Should we use a constants crate imported in both?
 //const O_RDONLY: i32 = 0o0000;
 const O_WRONLY: i32 = 0o0001;
@@ -254,8 +282,8 @@ pub trait SyscallInterface: Send + Sync {
 
 		let mut fs = fs::FILESYSTEM.lock();
 		let mut read_bytes = 0;
-		fs.fd_op(fd as u64, |file: &mut Box<dyn PosixFile>| {
-			read_bytes = file.read(buf).unwrap(); // TODO: might fail
+		fs.fd_op(fd as u64, |file| {
+			read_bytes = file.unwrap().read(buf).unwrap(); // TODO: might fail
 		});
 
 		read_bytes as isize
@@ -270,8 +298,8 @@ pub trait SyscallInterface: Send + Sync {
 
 			let mut written_bytes = 0;
 			let mut fs = fs::FILESYSTEM.lock();
-			fs.fd_op(fd as u64, |file: &mut Box<dyn PosixFile>| {
-				written_bytes = file.write(buf).unwrap(); // TODO: might fail
+			fs.fd_op(fd as u64, |file| {
+				written_bytes = file.unwrap().write(buf).unwrap(); // TODO: might fail
 			});
 			debug!("Write done! {}", written_bytes);
 			written_bytes as isize
@@ -294,13 +322,55 @@ pub trait SyscallInterface: Send + Sync {
 
 		let mut fs = fs::FILESYSTEM.lock();
 		let mut ret = 0;
-		fs.fd_op(fd as u64, |file: &mut Box<dyn PosixFile>| {
-			ret = file.lseek(offset, whence.try_into().unwrap()).unwrap(); // TODO: might fail
+		fs.fd_op(fd as u64, |file| {
+			ret = file
+				.unwrap()
+				.lseek(offset, whence.try_into().unwrap())
+				.unwrap(); // TODO: might fail
 		});
 
 		ret as isize
 	}
 
+	#[cfg(feature = "newlib")]
+	fn stat(&self, filename: *const u8, st: usize) -> i32 {
+		let filename = unsafe { util::c_str_to_str(filename) };
+		let st = st as *mut stat;
+
+		trace!("stat {}", filename);
+
+		let mut fs = fs::FILESYSTEM.lock();
+		let stat = fs.stat(&filename);
+
+		trace!("fuse: {:?}", stat);
+		if let Ok(stat) = stat {
+			unsafe {
+				(*st).st_dev = 0;
+				(*st).st_ino = 42; // stat.ino is too big
+				(*st).st_mode = stat.mode;
+				(*st).st_nlink = stat.nlink.try_into().unwrap();
+				(*st).st_uid = 0; // stat.uid
+				(*st).st_gid = 0; // stat.gid
+				(*st).st_rdev = stat.rdev.try_into().unwrap();
+				(*st).st_size = stat.size.try_into().unwrap();
+				(*st).st_atime = stat.atime.try_into().unwrap();
+				(*st).st_spare1 = 0;
+				(*st).st_mtime = stat.mtime.try_into().unwrap();
+				(*st).st_spare2 = 0;
+				(*st).st_ctime = stat.ctime.try_into().unwrap();
+				(*st).st_spare3 = 0;
+				(*st).st_blksize = stat.blksize.try_into().unwrap();
+				(*st).st_blocks = stat.blocks.try_into().unwrap();
+				(*st).st_spare4_0 = 0;
+				(*st).st_spare4_1 = 0;
+			}
+			0
+		} else {
+			-1
+		}
+	}
+
+	#[cfg(not(feature = "newlib"))]
 	fn stat(&self, _file: *const u8, _st: usize) -> i32 {
 		info!("stat is unimplemented");
 		-ENOSYS
