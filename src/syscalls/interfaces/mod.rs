@@ -248,15 +248,13 @@ pub trait SyscallInterface: Send + Sync {
 	fn read(&self, fd: i32, buf: *mut u8, len: usize) -> isize {
 		debug!("Read! {}, {}", fd, len);
 
+		// TODO: assert that buf is valid in userspace
+		let buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+
 		let mut fs = fs::FILESYSTEM.lock();
 		let mut read_bytes = 0;
 		fs.fd_op(fd as u64, |file: &mut Box<dyn PosixFile>| {
-			let dat = file.read(len as u32).unwrap(); // TODO: might fail
-
-			read_bytes = dat.len();
-			unsafe {
-				core::slice::from_raw_parts_mut(buf, read_bytes).copy_from_slice(&dat);
-			}
+			read_bytes = file.read(buf).unwrap(); // TODO: might fail
 		});
 
 		read_bytes as isize
