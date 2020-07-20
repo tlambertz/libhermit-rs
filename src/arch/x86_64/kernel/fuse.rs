@@ -18,8 +18,7 @@ use core::{fmt, u32, u8};
 // possible reponses for command: qemu/tools/virtiofsd/fuse_lowlevel.h
 
 const FUSE_ROOT_ID: u64 = 1;
-const MAX_READ_LEN: usize = 1024 * 64;
-const MAX_WRITE_LEN: usize = 1024 * 64;
+const MAX_BUFFER_SIZE: usize = 0x1000 * 256;
 
 pub trait FuseInterface {
 	fn send_command<S, T>(&mut self, cmd: Cmd<S>, rsp: Option<Rsp<T>>) -> Option<Rsp<T>>
@@ -31,6 +30,11 @@ pub trait FuseInterface {
 pub struct Fuse<T: FuseInterface> {
 	driver: Rc<RefCell<T>>,
 	dax_allocator: Option<Rc<RefCell<DaxAllocator>>>,
+	options: Option<Rc<FuseConnectionOptions>>,
+}
+
+struct FuseConnectionOptions {
+	max_bufsize: usize,
 }
 
 impl<T: FuseInterface + 'static> PosixFileSystem for Fuse<T> {
@@ -84,6 +88,7 @@ impl<T: FuseInterface + 'static> PosixFileSystem for Fuse<T> {
 				.map(|a| FuseDaxCache::new(a.clone())),
 			attr: fuse_attr,
 			open_options: perms,
+			connection_options: self.options.as_ref().unwrap().clone(), // unwrap can't fail, since we are initialized when opening
 		};
 		Ok(Box::new(file))
 	}
@@ -127,6 +132,7 @@ impl<T: FuseInterface + 'static> Fuse<T> {
 		Self {
 			driver,
 			dax_allocator: None,
+			options: None,
 		}
 	}
 
@@ -134,13 +140,25 @@ impl<T: FuseInterface + 'static> Fuse<T> {
 		Self {
 			driver,
 			dax_allocator: Some(Rc::new(RefCell::new(dax_allocator))),
+			options: None,
 		}
 	}
 
-	pub fn send_init(&self) {
+	pub fn send_init(&mut self) {
 		let (cmd, rsp) = create_init();
 		let rsp = self.driver.borrow_mut().send_command(cmd, Some(rsp));
 		trace!("fuse init answer: {:?}", rsp);
+
+		let bufsize = if let Some(rsp) = rsp {
+			core::cmp::min(rsp.rsp.max_write as usize, MAX_BUFFER_SIZE)
+		} else {
+			error!("Fuse initialization failed!");
+			0
+		};
+
+		self.options = Some(Rc::new(FuseConnectionOptions {
+			max_bufsize: bufsize as usize,
+		}));
 	}
 
 	pub fn lookup(&self, name: &str) -> Option<fuse_entry_out> {
@@ -158,15 +176,16 @@ struct FuseFile<T: FuseInterface> {
 	dax_cache: Option<FuseDaxCache>,
 	attr: fuse_attr,
 	open_options: FilePerms,
+	connection_options: Rc<FuseConnectionOptions>,
 }
 
 impl<T: FuseInterface> FuseFile<T> {
 	/// Reads the file using normal fuse read commands. File contents are in fuse reply
 	fn read_fuse(&mut self, buf: &mut [u8]) -> Result<Vec<u8>, FileError> {
 		let mut len = buf.len();
-		if len as usize > MAX_READ_LEN {
+		if len > self.connection_options.max_bufsize {
 			debug!("Reading longer than max_read_len: {}", len);
-			len = MAX_READ_LEN;
+			len = self.connection_options.max_bufsize;
 		}
 		if let Some(fh) = self.fuse_fh {
 			let (cmd, rsp) = create_read(fh, len as u32, self.offset as u64);
@@ -220,13 +239,13 @@ impl<T: FuseInterface> FuseFile<T> {
 
 	fn write_fuse(&mut self, buf: &[u8]) -> Result<u64, FileError> {
 		let mut len = buf.len();
-		if len as usize > MAX_WRITE_LEN {
+		if len > self.connection_options.max_bufsize {
 			debug!(
 				"Writing longer than max_write_len: {} > {}",
 				buf.len(),
-				MAX_WRITE_LEN
+				self.connection_options.max_bufsize
 			);
-			len = MAX_WRITE_LEN;
+			len = self.connection_options.max_bufsize;
 		}
 		if let Some(fh) = self.fuse_fh {
 			let (cmd, rsp) = create_write(fh, &buf[..len], self.offset as u64);
@@ -572,7 +591,7 @@ pub fn create_init() -> (Cmd<fuse_init_in>, Rsp<fuse_init_out>) {
 		major: 7,
 		minor: 31,
 		max_readahead: 0,
-		flags: 0,
+		flags: FUSE_MAX_PAGES, // Use max_pages so we can have reads/writes up to 256 pages instead of 32 pages.
 	};
 	let cmdhdr = create_in_header::<fuse_init_in>(Opcode::FUSE_INIT);
 	let rsp: fuse_init_out = Default::default();
@@ -631,6 +650,65 @@ pub struct fuse_out_header {
 	pub error: i32,
 	pub unique: u64,
 }
+
+/**
+ * INIT request/reply flags
+ *
+ * FUSE_ASYNC_READ: asynchronous read requests
+ * FUSE_POSIX_LOCKS: remote locking for POSIX file locks
+ * FUSE_FILE_OPS: kernel sends file handle for fstat, etc... (not yet supported)
+ * FUSE_ATOMIC_O_TRUNC: handles the O_TRUNC open flag in the filesystem
+ * FUSE_EXPORT_SUPPORT: filesystem handles lookups of "." and ".."
+ * FUSE_BIG_WRITES: filesystem can handle write size larger than 4kB
+ * FUSE_DONT_MASK: don't apply umask to file mode on create operations
+ * FUSE_SPLICE_WRITE: kernel supports splice write on the device
+ * FUSE_SPLICE_MOVE: kernel supports splice move on the device
+ * FUSE_SPLICE_READ: kernel supports splice read on the device
+ * FUSE_FLOCK_LOCKS: remote locking for BSD style file locks
+ * FUSE_HAS_IOCTL_DIR: kernel supports ioctl on directories
+ * FUSE_AUTO_INVAL_DATA: automatically invalidate cached pages
+ * FUSE_DO_READDIRPLUS: do READDIRPLUS (READDIR+LOOKUP in one)
+ * FUSE_READDIRPLUS_AUTO: adaptive readdirplus
+ * FUSE_ASYNC_DIO: asynchronous direct I/O submission
+ * FUSE_WRITEBACK_CACHE: use writeback cache for buffered writes
+ * FUSE_NO_OPEN_SUPPORT: kernel supports zero-message opens
+ * FUSE_PARALLEL_DIROPS: allow parallel lookups and readdir
+ * FUSE_HANDLE_KILLPRIV: fs handles killing suid/sgid/cap on write/chown/trunc
+ * FUSE_POSIX_ACL: filesystem supports posix acls
+ * FUSE_ABORT_ERROR: reading the device after abort returns ECONNABORTED
+ * FUSE_MAX_PAGES: init_out.max_pages contains the max number of req pages
+ * FUSE_CACHE_SYMLINKS: cache READLINK responses
+ * FUSE_NO_OPENDIR_SUPPORT: kernel supports zero-message opendir
+ * FUSE_EXPLICIT_INVAL_DATA: only invalidate cached pages on explicit request
+ * FUSE_MAP_ALIGNMENT: map_alignment field is valid
+ */
+pub const FUSE_ASYNC_READ: u32 = 1 << 0;
+pub const FUSE_POSIX_LOCKS: u32 = 1 << 1;
+pub const FUSE_FILE_OPS: u32 = 1 << 2;
+pub const FUSE_ATOMIC_O_TRUNC: u32 = 1 << 3;
+pub const FUSE_EXPORT_SUPPORT: u32 = 1 << 4;
+pub const FUSE_BIG_WRITES: u32 = 1 << 5;
+pub const FUSE_DONT_MASK: u32 = 1 << 6;
+pub const FUSE_SPLICE_WRITE: u32 = 1 << 7;
+pub const FUSE_SPLICE_MOVE: u32 = 1 << 8;
+pub const FUSE_SPLICE_READ: u32 = 1 << 9;
+pub const FUSE_FLOCK_LOCKS: u32 = 1 << 10;
+pub const FUSE_HAS_IOCTL_DIR: u32 = 1 << 11;
+pub const FUSE_AUTO_INVAL_DATA: u32 = 1 << 12;
+pub const FUSE_DO_READDIRPLUS: u32 = 1 << 13;
+pub const FUSE_READDIRPLUS_AUTO: u32 = 1 << 14;
+pub const FUSE_ASYNC_DIO: u32 = 1 << 15;
+pub const FUSE_WRITEBACK_CACHE: u32 = 1 << 16;
+pub const FUSE_NO_OPEN_SUPPORT: u32 = 1 << 17;
+pub const FUSE_PARALLEL_DIROPS: u32 = 1 << 18;
+pub const FUSE_HANDLE_KILLPRIV: u32 = 1 << 19;
+pub const FUSE_POSIX_ACL: u32 = 1 << 20;
+pub const FUSE_ABORT_ERROR: u32 = 1 << 21;
+pub const FUSE_MAX_PAGES: u32 = 1 << 22;
+pub const FUSE_CACHE_SYMLINKS: u32 = 1 << 23;
+pub const FUSE_NO_OPENDIR_SUPPORT: u32 = 1 << 24;
+pub const FUSE_EXPLICIT_INVAL_DATA: u32 = 1 << 25;
+pub const FUSE_MAP_ALIGNMENT: u32 = 1 << 26;
 
 #[repr(C)]
 #[derive(Debug)]
