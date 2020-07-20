@@ -175,7 +175,7 @@ impl<T: FuseInterface> FuseFile<T> {
 			let len = rsp.header.len as usize - ::core::mem::size_of::<fuse_out_header>();
 			self.offset += len;
 			// TODO: do this zerocopy
-			let mut vec = rsp.extra_buffer.unwrap();
+			let mut vec = rsp.extra_buffer.0.unwrap();
 			vec.truncate(len);
 			trace!("LEN: {}, VEC: {:?}", len, vec);
 			Ok(vec)
@@ -472,12 +472,36 @@ pub unsafe trait FuseIn {}
 /// Struct has to be repr(C)!
 pub unsafe trait FuseOut {}
 
+/// Stores read/write buffers
+pub struct FuseData(Option<Vec<u8>>);
+
+/// Print a maximum of 16 hex-chars for each buffer!
+impl fmt::Debug for FuseData {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		if let Some(buf) = &self.0 {
+			if buf.len() <= 16 {
+				write!(f, "{:x?}", buf)
+			} else {
+				// We are longer than 16 chars, truncate!
+				write!(
+					f,
+					"{:x?} (truncated from {:#x} bytes)",
+					&buf[..16],
+					buf.len()
+				)
+			}
+		} else {
+			write!(f, "None")
+		}
+	}
+}
+
 #[repr(C)]
 #[derive(Debug)]
 pub struct Cmd<T: FuseIn + core::fmt::Debug> {
 	header: fuse_in_header,
 	cmd: T,
-	extra_buffer: Option<Vec<u8>>, // eg for writes. allows zero-copy and avoids rust size_of operations (which always add alignment padding)
+	extra_buffer: FuseData, // eg for writes. allows zero-copy and avoids rust size_of operations (which always add alignment padding)
 }
 
 #[repr(C)]
@@ -485,7 +509,7 @@ pub struct Cmd<T: FuseIn + core::fmt::Debug> {
 pub struct Rsp<T: FuseOut + core::fmt::Debug> {
 	header: fuse_out_header,
 	rsp: T,
-	extra_buffer: Option<Vec<u8>>, // eg for reads. allows zero-copy and avoids rust size_of operations (which always add alignment padding)
+	extra_buffer: FuseData, // eg for reads. allows zero-copy and avoids rust size_of operations (which always add alignment padding)
 }
 
 // TODO: use from/into? But these require consuming the command, so we need some better memory model to avoid deallocation
@@ -501,7 +525,7 @@ where
 				::core::mem::size_of::<T>() + ::core::mem::size_of::<fuse_in_header>(),
 			)
 		};
-		if let Some(extra) = &self.extra_buffer {
+		if let Some(extra) = &self.extra_buffer.0 {
 			vec![rawcmd, &extra.as_ref()]
 		} else {
 			vec![rawcmd]
@@ -519,7 +543,7 @@ where
 				::core::mem::size_of::<T>() + ::core::mem::size_of::<fuse_out_header>(),
 			)
 		};
-		if let Some(extra) = self.extra_buffer.as_mut() {
+		if let Some(extra) = self.extra_buffer.0.as_mut() {
 			vec![rawrsp, extra]
 		} else {
 			vec![rawrsp]
@@ -557,12 +581,12 @@ pub fn create_init() -> (Cmd<fuse_init_in>, Rsp<fuse_init_out>) {
 		Cmd {
 			cmd,
 			header: cmdhdr,
-			extra_buffer: None,
+			extra_buffer: FuseData(None),
 		},
 		Rsp {
 			rsp,
 			header: rsphdr,
-			extra_buffer: None,
+			extra_buffer: FuseData(None),
 		},
 	)
 }
@@ -577,12 +601,12 @@ pub fn create_lookup(name: &str) -> (Cmd<fuse_lookup_in>, Rsp<fuse_entry_out>) {
 		Cmd {
 			cmd,
 			header: cmdhdr,
-			extra_buffer: None,
+			extra_buffer: FuseData(None),
 		},
 		Rsp {
 			rsp,
 			header: rsphdr,
-			extra_buffer: None,
+			extra_buffer: FuseData(None),
 		},
 	)
 }
@@ -680,12 +704,12 @@ pub fn create_read(nid: u64, size: u32, offset: u64) -> (Cmd<fuse_read_in>, Rsp<
 		Cmd {
 			cmd,
 			header: cmdhdr,
-			extra_buffer: None,
+			extra_buffer: FuseData(None),
 		},
 		Rsp {
 			rsp,
 			header: rsphdr,
-			extra_buffer: Some(readbuf),
+			extra_buffer: FuseData(Some(readbuf)),
 		},
 	)
 }
@@ -751,12 +775,12 @@ pub fn create_write(
 		Cmd {
 			cmd,
 			header: cmdhdr,
-			extra_buffer: Some(writebuf),
+			extra_buffer: FuseData(Some(writebuf)),
 		},
 		Rsp {
 			rsp,
 			header: rsphdr,
-			extra_buffer: None,
+			extra_buffer: FuseData(None),
 		},
 	)
 }
@@ -791,12 +815,12 @@ pub fn create_open(nid: u64, flags: u32) -> (Cmd<fuse_open_in>, Rsp<fuse_open_ou
 		Cmd {
 			cmd,
 			header: cmdhdr,
-			extra_buffer: None,
+			extra_buffer: FuseData(None),
 		},
 		Rsp {
 			rsp,
 			header: rsphdr,
-			extra_buffer: None,
+			extra_buffer: FuseData(None),
 		},
 	)
 }
@@ -827,12 +851,12 @@ pub fn create_release(nid: u64, fh: u64) -> (Cmd<fuse_release_in>, Rsp<fuse_rele
 		Cmd {
 			cmd,
 			header: cmdhdr,
-			extra_buffer: None,
+			extra_buffer: FuseData(None),
 		},
 		Rsp {
 			rsp,
 			header: rsphdr,
-			extra_buffer: None,
+			extra_buffer: FuseData(None),
 		},
 	)
 }
@@ -945,12 +969,12 @@ pub fn create_unlink(name: &str) -> (Cmd<fuse_unlink_in>, Rsp<fuse_unlink_out>) 
 		Cmd {
 			cmd,
 			header: cmdhdr,
-			extra_buffer: None,
+			extra_buffer: FuseData(None),
 		},
 		Rsp {
 			rsp,
 			header: rsphdr,
-			extra_buffer: None,
+			extra_buffer: FuseData(None),
 		},
 	)
 }
@@ -1012,12 +1036,12 @@ pub fn create_create(
 		Cmd {
 			cmd,
 			header: cmdhdr,
-			extra_buffer: None,
+			extra_buffer: FuseData(None),
 		},
 		Rsp {
 			rsp,
 			header: rsphdr,
-			extra_buffer: None,
+			extra_buffer: FuseData(None),
 		},
 	)
 }
@@ -1067,12 +1091,12 @@ pub fn create_setupmapping(
 		Cmd {
 			cmd,
 			header: cmdhdr,
-			extra_buffer: None,
+			extra_buffer: FuseData(None),
 		},
 		Rsp {
 			rsp,
 			header: rsphdr,
-			extra_buffer: None,
+			extra_buffer: FuseData(None),
 		},
 	)
 }
@@ -1119,12 +1143,12 @@ pub fn create_removemapping(
 		Cmd {
 			cmd,
 			header: cmdhdr,
-			extra_buffer: Some(extra),
+			extra_buffer: FuseData(Some(extra)),
 		},
 		Rsp {
 			rsp,
 			header: rsphdr,
-			extra_buffer: None,
+			extra_buffer: FuseData(None),
 		},
 	)
 }
