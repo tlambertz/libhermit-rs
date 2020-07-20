@@ -310,7 +310,7 @@ pub fn create_virtiofs_driver(
 	trace!("Driver after init: {:?}", drv);
 
 	// Instanciate global fuse object
-	let fuse = if let Some(shm) = &drv.borrow().shm_cfg {
+	let mut fuse = if let Some(shm) = &drv.borrow().shm_cfg {
 		info!("Found Cache! Using DAX! {:?}", shm);
 		let dax_allocator = DaxAllocator::new(shm.addr as u64, shm.len);
 		fuse::Fuse::new_with_dax(drv.clone(), dax_allocator)
