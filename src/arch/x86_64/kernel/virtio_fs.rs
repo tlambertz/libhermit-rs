@@ -5,7 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-use crate::arch::x86_64::kernel::fuse::{self, FuseInterface};
+use crate::arch::x86_64::kernel::fuse::{Fuse, FuseInterface};
 use crate::arch::x86_64::kernel::pci;
 use crate::arch::x86_64::kernel::virtio::{
 	self, consts::*, virtio_pci_common_cfg, VirtioNotification, VirtioSharedMemory, Virtq,
@@ -168,26 +168,12 @@ impl VirtioFsDriver<'_> {
 }
 
 impl FuseInterface for VirtioFsDriver<'_> {
-	fn send_command<S, T>(
-		&mut self,
-		cmd: fuse::Cmd<S>,
-		rsp: Option<fuse::Rsp<T>>,
-	) -> Option<fuse::Rsp<T>>
-	where
-		S: fuse::FuseIn + core::fmt::Debug,
-		T: fuse::FuseOut + core::fmt::Debug,
-	{
+	fn send_recv_buffers_blocking(&mut self, to_host: &[&[u8]], from_host: &[&mut [u8]]) {
 		// TODO: cmd/rsp gets deallocated when leaving scope.. maybe not the best idea for DMA, but PoC works with this
 		//       since we are blocking until done anyways.
-		trace!("Sending Fuse Command: {:?}", cmd);
 		if let Some(ref mut vqueues) = self.vqueues {
-			if let Some(mut rsp) = rsp {
-				vqueues[1].send_blocking(&cmd.to_u8buf(), Some(&rsp.to_u8buf_mut()));
-				trace!("Got Fuse Reply: {:?}", rsp);
-				return Some(rsp);
-			}
+			vqueues[1].send_blocking(to_host, Some(from_host));
 		}
-		None
 	}
 
 	/* TODO: make TEST out of this!
@@ -313,10 +299,10 @@ pub fn create_virtiofs_driver(
 	let mut fuse = if let Some(shm) = &drv.borrow().shm_cfg {
 		info!("Found Cache! Using DAX! {:?}", shm);
 		let dax_allocator = DaxAllocator::new(shm.addr as u64, shm.len);
-		fuse::Fuse::new_with_dax(drv.clone(), dax_allocator)
+		Fuse::new_with_dax(drv.clone(), dax_allocator)
 	} else {
 		info!("No Cache found, not using DAX!");
-		fuse::Fuse::new(drv.clone())
+		Fuse::new(drv.clone())
 	};
 
 	// send FUSE_INIT to create session

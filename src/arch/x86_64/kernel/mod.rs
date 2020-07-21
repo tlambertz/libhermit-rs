@@ -11,6 +11,7 @@ pub mod acpi;
 pub mod apic;
 pub mod fuse;
 pub mod fuse_dax;
+pub mod fuse_h;
 pub mod gdt;
 pub mod idt;
 pub mod irq;
