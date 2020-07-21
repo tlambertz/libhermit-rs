@@ -123,25 +123,36 @@ impl<T> Cmd<T>
 where
 	T: FuseIn + core::fmt::Debug,
 {
-	// TODO: this is more like as_u8buf
+	/// Returns vec of u8 buffers of different parts of the command, such that fuse host can interpret them.
+	/// Splits header and cmd into two, so virtiofsd fast write path works.
 	pub fn as_u8bufs(&self) -> Vec<&[u8]> {
-		let rawcmd = unsafe {
+		let rawheader = unsafe {
 			::core::slice::from_raw_parts(
 				(&self.header as *const fuse_in_header) as *const u8,
-				::core::mem::size_of::<T>() + ::core::mem::size_of::<fuse_in_header>(),
+				::core::mem::size_of::<fuse_in_header>(),
 			)
 		};
+		let rawcmd = unsafe {
+			::core::slice::from_raw_parts(
+				(&self.cmd as *const T) as *const u8,
+				::core::mem::size_of::<T>(),
+			)
+		};
+		//info!("{:#?}, {:#?}", rawheader, rawcmd);
 		if let Some(extra) = &self.extra_buffer.0 {
-			vec![rawcmd, &extra.as_ref()]
+			vec![rawheader, rawcmd, &extra.as_ref()]
 		} else {
-			vec![rawcmd]
+			vec![rawheader, rawcmd]
 		}
 	}
 }
+
 impl<T> Rsp<T>
 where
 	T: FuseOut + core::fmt::Debug,
 {
+	/// Returns Vec of mutable u8 buffers.
+	/// We don't split header and response here, but could do so if we want and still have the fast write case.
 	pub fn as_u8bufs_mut(&mut self) -> Vec<&mut [u8]> {
 		let rawrsp = unsafe {
 			::core::slice::from_raw_parts_mut(
