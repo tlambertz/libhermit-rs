@@ -6,12 +6,13 @@
 // copied, modified, or distributed except according to those terms.
 
 use super::fuse_dax::{CacheEntry, DaxAllocator, FuseDaxCache, FUSE_DAX_MEM_RANGE_SZ};
+use super::fuse_h::*;
 use crate::syscalls::fs::{self, FileError, FilePerms, PosixFile, PosixFileSystem, SeekWhence};
 use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
-use core::{fmt, u32, u8};
+use core::{u32, u8};
 
 // response out layout eg @ https://github.com/zargony/fuse-rs/blob/bf6d1cf03f3277e35b580f3c7b9999255d72ecf3/src/ll/request.rs#L44
 // op in/out sizes/layout: https://github.com/hanwen/go-fuse/blob/204b45dba899dfa147235c255908236d5fde2d32/fuse/opcode.go#L439
@@ -21,14 +22,52 @@ const FUSE_ROOT_ID: u64 = 1;
 const MAX_BUFFER_SIZE: usize = 0x1000 * 256;
 
 pub trait FuseInterface {
-	fn send_command<S, T>(&mut self, cmd: Cmd<S>, rsp: Option<Rsp<T>>) -> Option<Rsp<T>>
+	fn send_recv_buffers_blocking(&mut self, to_host: &[&[u8]], from_host: &[&mut [u8]]);
+}
+
+/// Driver which can easily be copied into a FuseFile
+/// Abstracts sending of a command over FuseInterface's byte arrays send/recv.
+struct FuseDriver<T: FuseInterface>(Rc<RefCell<T>>);
+
+impl<T: FuseInterface> FuseDriver<T> {
+	/// Send a command via the fuse driver with optional response.
+	/// Blocking, only returns once reply is available!
+	pub fn send_command<S, R>(&self, cmd: Cmd<S>, rsp: Option<Rsp<R>>) -> Option<Rsp<R>>
 	where
 		S: FuseIn + core::fmt::Debug,
-		T: FuseOut + core::fmt::Debug;
+		R: FuseOut + core::fmt::Debug,
+	{
+		// TODO: cmd/rsp gets deallocated when leaving scope.. maybe not the best idea for DMA, but PoC works with this
+		//       since we are blocking until done anyways.
+
+		trace!("Sending Fuse Command: {:?}", cmd);
+
+		let to_host = cmd.as_u8bufs();
+
+		if let Some(mut rsp) = rsp {
+			let from_host = rsp.as_u8bufs_mut();
+			self.0
+				.borrow_mut()
+				.send_recv_buffers_blocking(&to_host, &from_host);
+			trace!("Got Fuse Reply: {:?}", rsp);
+			Some(rsp)
+		} else {
+			self.0
+				.borrow_mut()
+				.send_recv_buffers_blocking(&to_host, &[]);
+			None
+		}
+	}
+
+	/// #derive[Clone] does not work because of https://github.com/rust-lang/rust/issues/41481
+	/// implement it ourselves
+	pub fn clone(&self) -> Self {
+		FuseDriver(self.0.clone())
+	}
 }
 
 pub struct Fuse<T: FuseInterface> {
-	driver: Rc<RefCell<T>>,
+	driver: FuseDriver<T>,
 	dax_allocator: Option<Rc<RefCell<DaxAllocator>>>,
 	options: Option<Rc<FuseConnectionOptions>>,
 }
@@ -59,17 +98,13 @@ impl<T: FuseInterface + 'static> PosixFileSystem for Fuse<T> {
 			}
 			// 3.FUSE_OPEN(nodeid, O_RDONLY) -> fh
 			let (cmd, rsp) = create_open(fuse_nid, perms.raw);
-			let rsp = self.driver.borrow_mut().send_command(cmd, Some(rsp));
+			let rsp = self.driver.send_command(cmd, Some(rsp));
 			trace!("Open answer {:?}", rsp);
 			fuse_fh = Some(rsp.unwrap().rsp.fh);
 		} else {
 			// Create file (opens implicitly, returns results from both lookup and open calls)
 			let (cmd, rsp) = create_create(path, perms.raw, perms.mode);
-			let rsp = self
-				.driver
-				.borrow_mut()
-				.send_command(cmd, Some(rsp))
-				.unwrap();
+			let rsp = self.driver.send_command(cmd, Some(rsp)).unwrap();
 			trace!("Create answer {:?}", rsp);
 
 			fuse_nid = rsp.rsp.entry.nodeid;
@@ -95,7 +130,7 @@ impl<T: FuseInterface + 'static> PosixFileSystem for Fuse<T> {
 
 	fn unlink(&self, path: &str) -> core::result::Result<(), FileError> {
 		let (cmd, rsp) = create_unlink(path);
-		let rsp = self.driver.borrow_mut().send_command(cmd, Some(rsp));
+		let rsp = self.driver.send_command(cmd, Some(rsp));
 		trace!("unlink answer {:?}", rsp);
 
 		Ok(())
@@ -130,7 +165,7 @@ impl<T: FuseInterface + 'static> PosixFileSystem for Fuse<T> {
 impl<T: FuseInterface + 'static> Fuse<T> {
 	pub fn new(driver: Rc<RefCell<T>>) -> Self {
 		Self {
-			driver,
+			driver: FuseDriver(driver),
 			dax_allocator: None,
 			options: None,
 		}
@@ -138,7 +173,7 @@ impl<T: FuseInterface + 'static> Fuse<T> {
 
 	pub fn new_with_dax(driver: Rc<RefCell<T>>, dax_allocator: DaxAllocator) -> Self {
 		Self {
-			driver,
+			driver: FuseDriver(driver),
 			dax_allocator: Some(Rc::new(RefCell::new(dax_allocator))),
 			options: None,
 		}
@@ -146,7 +181,7 @@ impl<T: FuseInterface + 'static> Fuse<T> {
 
 	pub fn send_init(&mut self) {
 		let (cmd, rsp) = create_init();
-		let rsp = self.driver.borrow_mut().send_command(cmd, Some(rsp));
+		let rsp = self.driver.send_command(cmd, Some(rsp));
 		trace!("fuse init answer: {:?}", rsp);
 
 		let bufsize = if let Some(rsp) = rsp {
@@ -163,13 +198,13 @@ impl<T: FuseInterface + 'static> Fuse<T> {
 
 	pub fn lookup(&self, name: &str) -> Option<fuse_entry_out> {
 		let (cmd, rsp) = create_lookup(name);
-		let rsp = self.driver.borrow_mut().send_command(cmd, Some(rsp));
+		let rsp = self.driver.send_command(cmd, Some(rsp));
 		Some(rsp.unwrap().rsp)
 	}
 }
 
 struct FuseFile<T: FuseInterface> {
-	driver: Rc<RefCell<T>>,
+	driver: FuseDriver<T>,
 	fuse_nid: Option<u64>,
 	fuse_fh: Option<u64>,
 	offset: usize,
@@ -189,7 +224,7 @@ impl<T: FuseInterface> FuseFile<T> {
 		}
 		if let Some(fh) = self.fuse_fh {
 			let (cmd, rsp) = create_read(fh, len as u32, self.offset as u64);
-			let rsp = self.driver.borrow_mut().send_command(cmd, Some(rsp));
+			let rsp = self.driver.send_command(cmd, Some(rsp));
 			let rsp = rsp.unwrap();
 			let len = rsp.header.len as usize - ::core::mem::size_of::<fuse_out_header>();
 			self.offset += len;
@@ -249,7 +284,7 @@ impl<T: FuseInterface> FuseFile<T> {
 		}
 		if let Some(fh) = self.fuse_fh {
 			let (cmd, rsp) = create_write(fh, &buf[..len], self.offset as u64);
-			let rsp = self.driver.borrow_mut().send_command(cmd, Some(rsp));
+			let rsp = self.driver.send_command(cmd, Some(rsp));
 			trace!("write response: {:?}", rsp);
 			let rsp = rsp.unwrap();
 
@@ -341,7 +376,7 @@ impl<T: FuseInterface> FuseFile<T> {
 				flags,
 				entry.get_moffset(),
 			);
-			let rsp = self.driver.borrow_mut().send_command(cmd, Some(rsp));
+			let rsp = self.driver.send_command(cmd, Some(rsp));
 			// TODO: check for errors. mapping might have failed.
 			Ok(entry)
 		} else {
@@ -365,7 +400,7 @@ impl<T: FuseInterface> FuseFile<T> {
 			}
 			trace!("Removing dax mappings {:?}", mappings);
 			let (cmd, rsp) = create_removemapping(self.fuse_nid.unwrap_or(0), &mappings);
-			let rsp = self.driver.borrow_mut().send_command(cmd, Some(rsp));
+			let rsp = self.driver.send_command(cmd, Some(rsp));
 
 			cache.free();
 		}
@@ -376,7 +411,7 @@ impl<T: FuseInterface> PosixFile for FuseFile<T> {
 	fn close(&mut self) -> Result<(), FileError> {
 		self.drop_cache();
 		let (cmd, rsp) = create_release(self.fuse_nid.unwrap(), self.fuse_fh.unwrap());
-		self.driver.borrow_mut().send_command(cmd, Some(rsp));
+		self.driver.send_command(cmd, Some(rsp));
 
 		Ok(())
 	}
@@ -414,160 +449,246 @@ impl<T: FuseInterface> PosixFile for FuseFile<T> {
 	}
 }
 
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-#[allow(non_camel_case_types)]
-pub enum Opcode {
-	FUSE_LOOKUP = 1,
-	FUSE_FORGET = 2, // no reply
-	FUSE_GETATTR = 3,
-	FUSE_SETATTR = 4,
-	FUSE_READLINK = 5,
-	FUSE_SYMLINK = 6,
-	FUSE_MKNOD = 8,
-	FUSE_MKDIR = 9,
-	FUSE_UNLINK = 10,
-	FUSE_RMDIR = 11,
-	FUSE_RENAME = 12,
-	FUSE_LINK = 13,
-	FUSE_OPEN = 14,
-	FUSE_READ = 15,
-	FUSE_WRITE = 16,
-	FUSE_STATFS = 17,
-	FUSE_RELEASE = 18,
-	FUSE_FSYNC = 20,
-	FUSE_SETXATTR = 21,
-	FUSE_GETXATTR = 22,
-	FUSE_LISTXATTR = 23,
-	FUSE_REMOVEXATTR = 24,
-	FUSE_FLUSH = 25,
-	FUSE_INIT = 26,
-	FUSE_OPENDIR = 27,
-	FUSE_READDIR = 28,
-	FUSE_RELEASEDIR = 29,
-	FUSE_FSYNCDIR = 30,
-	FUSE_GETLK = 31,
-	FUSE_SETLK = 32,
-	FUSE_SETLKW = 33,
-	FUSE_ACCESS = 34,
-	FUSE_CREATE = 35,
-	FUSE_INTERRUPT = 36,
-	FUSE_BMAP = 37,
-	FUSE_DESTROY = 38,
-	FUSE_IOCTL = 39,
-	FUSE_POLL = 40,
-	FUSE_NOTIFY_REPLY = 41,
-	FUSE_BATCH_FORGET = 42,
-	FUSE_FALLOCATE = 43,
-
-	FUSE_SETUPMAPPING = 48,
-	FUSE_REMOVEMAPPING = 49,
-
-	FUSE_SETVOLNAME = 61,
-	FUSE_GETXTIMES = 62,
-	FUSE_EXCHANGE = 63,
-
-	CUSE_INIT = 4096,
-}
-
-// From https://stackoverflow.com/questions/28127165/how-to-convert-struct-to-u8
-/*unsafe fn any_as_u8_slice<T: Sized>(p: &T) -> &[u8] {
-	::core::slice::from_raw_parts(
-		(p as *const T) as *const u8,
-		::core::mem::size_of::<T>(),
+pub fn create_setupmapping(
+	fh: u64,
+	foffset: u64,
+	len: u64,
+	flags: u64,
+	moffset: u64,
+) -> (Cmd<fuse_setupmapping_in>, Rsp<fuse_setupmapping_out>) {
+	let cmd: fuse_setupmapping_in = fuse_setupmapping_in {
+		fh,
+		foffset,
+		len,
+		flags,
+		moffset,
+	};
+	let mut cmdhdr = create_in_header::<fuse_setupmapping_in>(Opcode::FUSE_SETUPMAPPING);
+	cmdhdr.nodeid = core::u64::MAX; // -1
+	let rsp = Default::default();
+	let rsphdr = Default::default();
+	(
+		Cmd {
+			cmd,
+			header: cmdhdr,
+			extra_buffer: FuseData(None),
+		},
+		Rsp {
+			rsp,
+			header: rsphdr,
+			extra_buffer: FuseData(None),
+		},
 	)
 }
-unsafe fn any_as_u8_slice_mut<T: Sized>(p: &mut T) -> &mut [u8] {
-	::core::slice::from_raw_parts_mut(
-		(p as *mut T) as *mut u8,
-		::core::mem::size_of::<T>(),
+
+pub fn create_removemapping(
+	nid: u64,
+	mappings: &Vec<fuse_removemapping_one>,
+) -> (Cmd<fuse_removemapping_in>, Rsp<fuse_removemapping_out>) {
+	let cmd: fuse_removemapping_in = fuse_removemapping_in {
+		count: mappings.len() as u32,
+	};
+	let mut cmdhdr = create_in_header::<fuse_removemapping_in>(Opcode::FUSE_REMOVEMAPPING);
+	cmdhdr.nodeid = nid;
+	let rsp = Default::default();
+
+	// Get u8buf of Vec
+	// TODO: create an interface that allows this without copying.
+	let byte_ptr = mappings.as_ptr() as *const u8;
+	let byte_len = mappings.len() * core::mem::size_of::<fuse_removemapping_one>();
+	let byte_arr = unsafe { core::slice::from_raw_parts(byte_ptr, byte_len) };
+	let extra = Vec::from(byte_arr);
+
+	let rsphdr = Default::default();
+	(
+		Cmd {
+			cmd,
+			header: cmdhdr,
+			extra_buffer: FuseData(Some(extra)),
+		},
+		Rsp {
+			rsp,
+			header: rsphdr,
+			extra_buffer: FuseData(None),
+		},
 	)
-}*/
-
-/// Marker trait, which signals that a struct is a valid Fuse command.
-/// Struct has to be repr(C)!
-pub unsafe trait FuseIn {}
-/// Marker trait, which signals that a struct is a valid Fuse response.
-/// Struct has to be repr(C)!
-pub unsafe trait FuseOut {}
-
-/// Stores read/write buffers
-pub struct FuseData(Option<Vec<u8>>);
-
-/// Print a maximum of 16 hex-chars for each buffer!
-impl fmt::Debug for FuseData {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		if let Some(buf) = &self.0 {
-			if buf.len() <= 16 {
-				write!(f, "{:x?}", buf)
-			} else {
-				// We are longer than 16 chars, truncate!
-				write!(
-					f,
-					"{:x?} (truncated from {:#x} bytes)",
-					&buf[..16],
-					buf.len()
-				)
-			}
-		} else {
-			write!(f, "None")
-		}
-	}
 }
 
-#[repr(C)]
-#[derive(Debug)]
-pub struct Cmd<T: FuseIn + core::fmt::Debug> {
-	header: fuse_in_header,
-	cmd: T,
-	extra_buffer: FuseData, // eg for writes. allows zero-copy and avoids rust size_of operations (which always add alignment padding)
+pub fn create_create(
+	path: &str,
+	flags: u32,
+	mode: u32,
+) -> (Cmd<fuse_create_in>, Rsp<fuse_create_out>) {
+	let cmd = fuse_create_in::new(path, flags, mode);
+	let mut cmdhdr = create_in_header::<fuse_create_in>(Opcode::FUSE_CREATE);
+	cmdhdr.nodeid = FUSE_ROOT_ID;
+	let rsp = Default::default();
+	let rsphdr = Default::default();
+	(
+		Cmd {
+			cmd,
+			header: cmdhdr,
+			extra_buffer: FuseData(None),
+		},
+		Rsp {
+			rsp,
+			header: rsphdr,
+			extra_buffer: FuseData(None),
+		},
+	)
 }
 
-#[repr(C)]
-#[derive(Debug)]
-pub struct Rsp<T: FuseOut + core::fmt::Debug> {
-	header: fuse_out_header,
-	rsp: T,
-	extra_buffer: FuseData, // eg for reads. allows zero-copy and avoids rust size_of operations (which always add alignment padding)
+pub fn create_unlink(name: &str) -> (Cmd<fuse_unlink_in>, Rsp<fuse_unlink_out>) {
+	let cmd = name.into();
+	let mut cmdhdr = create_in_header::<fuse_unlink_in>(Opcode::FUSE_UNLINK);
+	cmdhdr.nodeid = FUSE_ROOT_ID;
+	let rsp: fuse_unlink_out = Default::default();
+	let rsphdr: fuse_out_header = Default::default();
+	(
+		Cmd {
+			cmd,
+			header: cmdhdr,
+			extra_buffer: FuseData(None),
+		},
+		Rsp {
+			rsp,
+			header: rsphdr,
+			extra_buffer: FuseData(None),
+		},
+	)
 }
 
-// TODO: use from/into? But these require consuming the command, so we need some better memory model to avoid deallocation
-impl<T> Cmd<T>
-where
-	T: FuseIn + core::fmt::Debug,
-{
-	// TODO: this is more like as_u8buf
-	pub fn to_u8buf(&self) -> Vec<&[u8]> {
-		let rawcmd = unsafe {
-			::core::slice::from_raw_parts(
-				(&self.header as *const fuse_in_header) as *const u8,
-				::core::mem::size_of::<T>() + ::core::mem::size_of::<fuse_in_header>(),
-			)
-		};
-		if let Some(extra) = &self.extra_buffer.0 {
-			vec![rawcmd, &extra.as_ref()]
-		} else {
-			vec![rawcmd]
-		}
-	}
+pub fn create_release(nid: u64, fh: u64) -> (Cmd<fuse_release_in>, Rsp<fuse_release_out>) {
+	let mut cmd: fuse_release_in = Default::default();
+	let mut cmdhdr = create_in_header::<fuse_release_in>(Opcode::FUSE_RELEASE);
+	cmdhdr.nodeid = nid;
+	cmd.fh = fh;
+	let rsp = Default::default();
+	let rsphdr = Default::default();
+	(
+		Cmd {
+			cmd,
+			header: cmdhdr,
+			extra_buffer: FuseData(None),
+		},
+		Rsp {
+			rsp,
+			header: rsphdr,
+			extra_buffer: FuseData(None),
+		},
+	)
 }
-impl<T> Rsp<T>
-where
-	T: FuseOut + core::fmt::Debug,
-{
-	pub fn to_u8buf_mut(&mut self) -> Vec<&mut [u8]> {
-		let rawrsp = unsafe {
-			::core::slice::from_raw_parts_mut(
-				(&mut self.header as *mut fuse_out_header) as *mut u8,
-				::core::mem::size_of::<T>() + ::core::mem::size_of::<fuse_out_header>(),
-			)
-		};
-		if let Some(extra) = self.extra_buffer.0.as_mut() {
-			vec![rawrsp, extra]
-		} else {
-			vec![rawrsp]
-		}
-	}
+
+pub fn create_open(nid: u64, flags: u32) -> (Cmd<fuse_open_in>, Rsp<fuse_open_out>) {
+	let cmd = fuse_open_in {
+		flags,
+		..Default::default()
+	};
+	let mut cmdhdr = create_in_header::<fuse_open_in>(Opcode::FUSE_OPEN);
+	cmdhdr.nodeid = nid;
+	let rsp = Default::default();
+	let rsphdr = Default::default();
+	(
+		Cmd {
+			cmd,
+			header: cmdhdr,
+			extra_buffer: FuseData(None),
+		},
+		Rsp {
+			rsp,
+			header: rsphdr,
+			extra_buffer: FuseData(None),
+		},
+	)
+}
+
+#[repr(C, align(4096))]
+struct AlignToPage([u8; 4096]);
+// TODO: do write zerocopy? currently does buf.to_vec()
+// problem: i cannot create owned type, since this would deallocate memory on drop. But memory belongs to userspace!
+//          Using references, i have to be careful of lifetimes!
+pub fn create_write(
+	nid: u64,
+	buf: &[u8],
+	offset: u64,
+) -> (Cmd<fuse_write_in>, Rsp<fuse_write_out>) {
+	let cmd = fuse_write_in {
+		offset,
+		size: buf.len() as u32,
+		..Default::default()
+	};
+	let mut cmdhdr = create_in_header::<fuse_write_in>(Opcode::FUSE_WRITE);
+	cmdhdr.nodeid = nid;
+	let rsp = Default::default();
+	let rsphdr = Default::default();
+
+	//direct-io requires aligned memory.
+	// ugly hack from https://stackoverflow.com/questions/60180121/how-do-i-allocate-a-vecu8-that-is-aligned-to-the-size-of-the-cache-line
+	let mut aligned: Vec<AlignToPage> =
+		Vec::with_capacity(buf.len() / ::core::mem::size_of::<AlignToPage>() + 1);
+	let ptr = aligned.as_mut_ptr();
+	let cap_units = aligned.capacity();
+	::core::mem::forget(aligned);
+	let mut writebuf = unsafe {
+		Vec::from_raw_parts(
+			ptr as *mut u8,
+			buf.len(),
+			cap_units * ::core::mem::size_of::<AlignToPage>(),
+		)
+	};
+	writebuf.clone_from_slice(buf);
+	// let writebuf = buf.to_vec();
+	(
+		Cmd {
+			cmd,
+			header: cmdhdr,
+			extra_buffer: FuseData(Some(writebuf)),
+		},
+		Rsp {
+			rsp,
+			header: rsphdr,
+			extra_buffer: FuseData(None),
+		},
+	)
+}
+
+pub fn create_read(nid: u64, size: u32, offset: u64) -> (Cmd<fuse_read_in>, Rsp<fuse_read_out>) {
+	let cmd = fuse_read_in {
+		offset,
+		size,
+		..Default::default()
+	};
+	let mut cmdhdr = create_in_header::<fuse_read_in>(Opcode::FUSE_READ);
+	cmdhdr.nodeid = nid;
+	let rsp = Default::default();
+	let rsphdr = Default::default();
+	// direct-io requires aligned memory.
+	// ugly hack from https://stackoverflow.com/questions/60180121/how-do-i-allocate-a-vecu8-that-is-aligned-to-the-size-of-the-cache-line
+	let mut aligned: Vec<AlignToPage> =
+		Vec::with_capacity(size as usize / ::core::mem::size_of::<AlignToPage>() + 1);
+	let ptr = aligned.as_mut_ptr();
+	let cap_units = aligned.capacity();
+	::core::mem::forget(aligned);
+	let readbuf = unsafe {
+		Vec::from_raw_parts(
+			ptr as *mut u8,
+			size as usize,
+			cap_units * ::core::mem::size_of::<AlignToPage>(),
+		)
+	};
+	// let readbuf = vec![0; size as usize];
+	(
+		Cmd {
+			cmd,
+			header: cmdhdr,
+			extra_buffer: FuseData(None),
+		},
+		Rsp {
+			rsp,
+			header: rsphdr,
+			extra_buffer: FuseData(Some(readbuf)),
+		},
+	)
 }
 
 pub fn create_in_header<T>(opcode: Opcode) -> fuse_in_header
@@ -621,607 +742,6 @@ pub fn create_lookup(name: &str) -> (Cmd<fuse_lookup_in>, Rsp<fuse_entry_out>) {
 			cmd,
 			header: cmdhdr,
 			extra_buffer: FuseData(None),
-		},
-		Rsp {
-			rsp,
-			header: rsphdr,
-			extra_buffer: FuseData(None),
-		},
-	)
-}
-
-#[repr(C)]
-#[derive(Debug)]
-pub struct fuse_in_header {
-	pub len: u32,
-	pub opcode: u32,
-	pub unique: u64,
-	pub nodeid: u64,
-	pub uid: u32,
-	pub gid: u32,
-	pub pid: u32,
-	pub padding: u32,
-}
-
-#[repr(C)]
-#[derive(Debug, Default)]
-pub struct fuse_out_header {
-	pub len: u32,
-	pub error: i32,
-	pub unique: u64,
-}
-
-/**
- * INIT request/reply flags
- *
- * FUSE_ASYNC_READ: asynchronous read requests
- * FUSE_POSIX_LOCKS: remote locking for POSIX file locks
- * FUSE_FILE_OPS: kernel sends file handle for fstat, etc... (not yet supported)
- * FUSE_ATOMIC_O_TRUNC: handles the O_TRUNC open flag in the filesystem
- * FUSE_EXPORT_SUPPORT: filesystem handles lookups of "." and ".."
- * FUSE_BIG_WRITES: filesystem can handle write size larger than 4kB
- * FUSE_DONT_MASK: don't apply umask to file mode on create operations
- * FUSE_SPLICE_WRITE: kernel supports splice write on the device
- * FUSE_SPLICE_MOVE: kernel supports splice move on the device
- * FUSE_SPLICE_READ: kernel supports splice read on the device
- * FUSE_FLOCK_LOCKS: remote locking for BSD style file locks
- * FUSE_HAS_IOCTL_DIR: kernel supports ioctl on directories
- * FUSE_AUTO_INVAL_DATA: automatically invalidate cached pages
- * FUSE_DO_READDIRPLUS: do READDIRPLUS (READDIR+LOOKUP in one)
- * FUSE_READDIRPLUS_AUTO: adaptive readdirplus
- * FUSE_ASYNC_DIO: asynchronous direct I/O submission
- * FUSE_WRITEBACK_CACHE: use writeback cache for buffered writes
- * FUSE_NO_OPEN_SUPPORT: kernel supports zero-message opens
- * FUSE_PARALLEL_DIROPS: allow parallel lookups and readdir
- * FUSE_HANDLE_KILLPRIV: fs handles killing suid/sgid/cap on write/chown/trunc
- * FUSE_POSIX_ACL: filesystem supports posix acls
- * FUSE_ABORT_ERROR: reading the device after abort returns ECONNABORTED
- * FUSE_MAX_PAGES: init_out.max_pages contains the max number of req pages
- * FUSE_CACHE_SYMLINKS: cache READLINK responses
- * FUSE_NO_OPENDIR_SUPPORT: kernel supports zero-message opendir
- * FUSE_EXPLICIT_INVAL_DATA: only invalidate cached pages on explicit request
- * FUSE_MAP_ALIGNMENT: map_alignment field is valid
- */
-pub const FUSE_ASYNC_READ: u32 = 1 << 0;
-pub const FUSE_POSIX_LOCKS: u32 = 1 << 1;
-pub const FUSE_FILE_OPS: u32 = 1 << 2;
-pub const FUSE_ATOMIC_O_TRUNC: u32 = 1 << 3;
-pub const FUSE_EXPORT_SUPPORT: u32 = 1 << 4;
-pub const FUSE_BIG_WRITES: u32 = 1 << 5;
-pub const FUSE_DONT_MASK: u32 = 1 << 6;
-pub const FUSE_SPLICE_WRITE: u32 = 1 << 7;
-pub const FUSE_SPLICE_MOVE: u32 = 1 << 8;
-pub const FUSE_SPLICE_READ: u32 = 1 << 9;
-pub const FUSE_FLOCK_LOCKS: u32 = 1 << 10;
-pub const FUSE_HAS_IOCTL_DIR: u32 = 1 << 11;
-pub const FUSE_AUTO_INVAL_DATA: u32 = 1 << 12;
-pub const FUSE_DO_READDIRPLUS: u32 = 1 << 13;
-pub const FUSE_READDIRPLUS_AUTO: u32 = 1 << 14;
-pub const FUSE_ASYNC_DIO: u32 = 1 << 15;
-pub const FUSE_WRITEBACK_CACHE: u32 = 1 << 16;
-pub const FUSE_NO_OPEN_SUPPORT: u32 = 1 << 17;
-pub const FUSE_PARALLEL_DIROPS: u32 = 1 << 18;
-pub const FUSE_HANDLE_KILLPRIV: u32 = 1 << 19;
-pub const FUSE_POSIX_ACL: u32 = 1 << 20;
-pub const FUSE_ABORT_ERROR: u32 = 1 << 21;
-pub const FUSE_MAX_PAGES: u32 = 1 << 22;
-pub const FUSE_CACHE_SYMLINKS: u32 = 1 << 23;
-pub const FUSE_NO_OPENDIR_SUPPORT: u32 = 1 << 24;
-pub const FUSE_EXPLICIT_INVAL_DATA: u32 = 1 << 25;
-pub const FUSE_MAP_ALIGNMENT: u32 = 1 << 26;
-
-#[repr(C)]
-#[derive(Debug)]
-pub struct fuse_init_in {
-	pub major: u32,
-	pub minor: u32,
-	pub max_readahead: u32,
-	pub flags: u32,
-}
-unsafe impl FuseIn for fuse_init_in {}
-
-#[repr(C)]
-#[derive(Debug, Default)]
-pub struct fuse_init_out {
-	pub major: u32,
-	pub minor: u32,
-	pub max_readahead: u32,
-	pub flags: u32,
-	pub max_background: u16,
-	pub congestion_threshold: u16,
-	pub max_write: u32,
-	pub time_gran: u32,
-	pub unused: [u32; 9],
-}
-unsafe impl FuseOut for fuse_init_out {}
-
-#[repr(C)]
-#[derive(Default, Debug)]
-pub struct fuse_read_in {
-	pub fh: u64,
-	pub offset: u64,
-	pub size: u32,
-	pub read_flags: u32,
-	pub lock_owner: u64,
-	pub flags: u32,
-	pub padding: u32,
-}
-unsafe impl FuseIn for fuse_read_in {}
-
-#[repr(C)]
-#[derive(Default, Debug)]
-pub struct fuse_read_out {}
-unsafe impl FuseOut for fuse_read_out {}
-
-pub fn create_read(nid: u64, size: u32, offset: u64) -> (Cmd<fuse_read_in>, Rsp<fuse_read_out>) {
-	let cmd = fuse_read_in {
-		offset,
-		size,
-		..Default::default()
-	};
-	let mut cmdhdr = create_in_header::<fuse_read_in>(Opcode::FUSE_READ);
-	cmdhdr.nodeid = nid;
-	let rsp = Default::default();
-	let rsphdr = Default::default();
-	// direct-io requires aligned memory.
-	// ugly hack from https://stackoverflow.com/questions/60180121/how-do-i-allocate-a-vecu8-that-is-aligned-to-the-size-of-the-cache-line
-	let mut aligned: Vec<AlignToPage> =
-		Vec::with_capacity(size as usize / ::core::mem::size_of::<AlignToPage>() + 1);
-	let ptr = aligned.as_mut_ptr();
-	let cap_units = aligned.capacity();
-	::core::mem::forget(aligned);
-	let readbuf = unsafe {
-		Vec::from_raw_parts(
-			ptr as *mut u8,
-			size as usize,
-			cap_units * ::core::mem::size_of::<AlignToPage>(),
-		)
-	};
-	// let readbuf = vec![0; size as usize];
-	(
-		Cmd {
-			cmd,
-			header: cmdhdr,
-			extra_buffer: FuseData(None),
-		},
-		Rsp {
-			rsp,
-			header: rsphdr,
-			extra_buffer: FuseData(Some(readbuf)),
-		},
-	)
-}
-
-#[repr(C)]
-#[derive(Default, Debug)]
-pub struct fuse_write_in {
-	pub fh: u64,
-	pub offset: u64,
-	pub size: u32,
-	pub write_flags: u32,
-	pub lock_owner: u64,
-	pub flags: u32,
-	pub padding: u32,
-}
-unsafe impl FuseIn for fuse_write_in {}
-
-#[repr(C)]
-#[derive(Default, Debug)]
-pub struct fuse_write_out {
-	pub size: u32,
-	pub padding: u32,
-}
-unsafe impl FuseOut for fuse_write_out {}
-
-#[repr(C, align(4096))]
-struct AlignToPage([u8; 4096]);
-// TODO: do write zerocopy? currently does buf.to_vec()
-// problem: i cannot create owned type, since this would deallocate memory on drop. But memory belongs to userspace!
-//          Using references, i have to be careful of lifetimes!
-pub fn create_write(
-	nid: u64,
-	buf: &[u8],
-	offset: u64,
-) -> (Cmd<fuse_write_in>, Rsp<fuse_write_out>) {
-	let cmd = fuse_write_in {
-		offset,
-		size: buf.len() as u32,
-		..Default::default()
-	};
-	let mut cmdhdr = create_in_header::<fuse_write_in>(Opcode::FUSE_WRITE);
-	cmdhdr.nodeid = nid;
-	let rsp = Default::default();
-	let rsphdr = Default::default();
-
-	//direct-io requires aligned memory.
-	// ugly hack from https://stackoverflow.com/questions/60180121/how-do-i-allocate-a-vecu8-that-is-aligned-to-the-size-of-the-cache-line
-	let mut aligned: Vec<AlignToPage> =
-		Vec::with_capacity(buf.len() / ::core::mem::size_of::<AlignToPage>() + 1);
-	let ptr = aligned.as_mut_ptr();
-	let cap_units = aligned.capacity();
-	::core::mem::forget(aligned);
-	let mut writebuf = unsafe {
-		Vec::from_raw_parts(
-			ptr as *mut u8,
-			buf.len(),
-			cap_units * ::core::mem::size_of::<AlignToPage>(),
-		)
-	};
-	writebuf.clone_from_slice(buf);
-	// let writebuf = buf.to_vec();
-	(
-		Cmd {
-			cmd,
-			header: cmdhdr,
-			extra_buffer: FuseData(Some(writebuf)),
-		},
-		Rsp {
-			rsp,
-			header: rsphdr,
-			extra_buffer: FuseData(None),
-		},
-	)
-}
-
-#[repr(C)]
-#[derive(Default, Debug)]
-pub struct fuse_open_in {
-	pub flags: u32,
-	pub unused: u32,
-}
-unsafe impl FuseIn for fuse_open_in {}
-
-#[repr(C)]
-#[derive(Default, Debug)]
-pub struct fuse_open_out {
-	pub fh: u64,
-	pub open_flags: u32,
-	pub padding: u32,
-}
-unsafe impl FuseOut for fuse_open_out {}
-
-pub fn create_open(nid: u64, flags: u32) -> (Cmd<fuse_open_in>, Rsp<fuse_open_out>) {
-	let cmd = fuse_open_in {
-		flags,
-		..Default::default()
-	};
-	let mut cmdhdr = create_in_header::<fuse_open_in>(Opcode::FUSE_OPEN);
-	cmdhdr.nodeid = nid;
-	let rsp = Default::default();
-	let rsphdr = Default::default();
-	(
-		Cmd {
-			cmd,
-			header: cmdhdr,
-			extra_buffer: FuseData(None),
-		},
-		Rsp {
-			rsp,
-			header: rsphdr,
-			extra_buffer: FuseData(None),
-		},
-	)
-}
-
-#[repr(C)]
-#[derive(Default, Debug)]
-pub struct fuse_release_in {
-	pub fh: u64,
-	pub flags: u32,
-	pub release_flags: u32,
-	pub lock_owner: u64,
-}
-unsafe impl FuseIn for fuse_release_in {}
-
-#[repr(C)]
-#[derive(Default, Debug)]
-pub struct fuse_release_out {}
-unsafe impl FuseOut for fuse_release_out {}
-
-pub fn create_release(nid: u64, fh: u64) -> (Cmd<fuse_release_in>, Rsp<fuse_release_out>) {
-	let mut cmd: fuse_release_in = Default::default();
-	let mut cmdhdr = create_in_header::<fuse_release_in>(Opcode::FUSE_RELEASE);
-	cmdhdr.nodeid = nid;
-	cmd.fh = fh;
-	let rsp = Default::default();
-	let rsphdr = Default::default();
-	(
-		Cmd {
-			cmd,
-			header: cmdhdr,
-			extra_buffer: FuseData(None),
-		},
-		Rsp {
-			rsp,
-			header: rsphdr,
-			extra_buffer: FuseData(None),
-		},
-	)
-}
-
-fn str_into_u8buf(s: &str, u8buf: &mut [u8]) {
-	// TODO: fix this hacky conversion..
-	for (i, c) in s.chars().enumerate() {
-		u8buf[i] = c as u8;
-		if i > u8buf.len() {
-			warn!("FUSE: Name too long!");
-			break;
-		}
-	}
-}
-
-// TODO: max path length?
-const MAX_PATH_LEN: usize = 256;
-fn str_to_path(s: &str) -> [u8; MAX_PATH_LEN] {
-	let mut buf = [0 as u8; MAX_PATH_LEN];
-	str_into_u8buf(s, &mut buf);
-	buf
-}
-
-#[repr(C)]
-pub struct fuse_lookup_in {
-	pub name: [u8; MAX_PATH_LEN],
-}
-unsafe impl FuseIn for fuse_lookup_in {}
-
-impl From<&str> for fuse_lookup_in {
-	fn from(name: &str) -> Self {
-		Self {
-			name: str_to_path(name),
-		}
-	}
-}
-
-impl fmt::Debug for fuse_lookup_in {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(f, "fuse_lookup_in {{ {:?} }}", &self.name[..])
-	}
-}
-
-#[repr(C)]
-#[derive(Default, Debug)]
-pub struct fuse_entry_out {
-	pub nodeid: u64,
-	pub generation: u64,
-	pub entry_valid: u64,
-	pub attr_valid: u64,
-	pub entry_valid_nsec: u32,
-	pub attr_valid_nsec: u32,
-	pub attr: fuse_attr,
-}
-unsafe impl FuseOut for fuse_entry_out {}
-
-#[repr(C)]
-#[derive(Default, Debug)]
-pub struct fuse_attr {
-	pub ino: u64,
-	pub size: u64,
-	pub blocks: u64,
-	pub atime: u64,
-	pub mtime: u64,
-	pub ctime: u64,
-	pub atimensec: u32,
-	pub mtimensec: u32,
-	pub ctimensec: u32,
-	pub mode: u32, // eg 0o100644
-	pub nlink: u32,
-	pub uid: u32,
-	pub gid: u32,
-	pub rdev: u32,
-	pub blksize: u32,
-	pub padding: u32,
-}
-
-#[repr(C)]
-pub struct fuse_unlink_in {
-	pub name: [u8; MAX_PATH_LEN],
-}
-unsafe impl FuseIn for fuse_unlink_in {}
-
-impl From<&str> for fuse_unlink_in {
-	fn from(name: &str) -> Self {
-		Self {
-			name: str_to_path(name),
-		}
-	}
-}
-
-impl fmt::Debug for fuse_unlink_in {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(f, "fuse_unlink_in {{ {:?} }}", &self.name[..])
-	}
-}
-
-#[repr(C)]
-#[derive(Default, Debug)]
-pub struct fuse_unlink_out {}
-unsafe impl FuseOut for fuse_unlink_out {}
-
-pub fn create_unlink(name: &str) -> (Cmd<fuse_unlink_in>, Rsp<fuse_unlink_out>) {
-	let cmd = name.into();
-	let mut cmdhdr = create_in_header::<fuse_unlink_in>(Opcode::FUSE_UNLINK);
-	cmdhdr.nodeid = FUSE_ROOT_ID;
-	let rsp: fuse_unlink_out = Default::default();
-	let rsphdr: fuse_out_header = Default::default();
-	(
-		Cmd {
-			cmd,
-			header: cmdhdr,
-			extra_buffer: FuseData(None),
-		},
-		Rsp {
-			rsp,
-			header: rsphdr,
-			extra_buffer: FuseData(None),
-		},
-	)
-}
-
-#[repr(C)]
-pub struct fuse_create_in {
-	pub flags: u32,
-	pub mode: u32,
-	pub umask: u32,
-	pub padding: u32,
-	pub name: [u8; MAX_PATH_LEN],
-}
-unsafe impl FuseIn for fuse_create_in {}
-
-#[repr(C)]
-#[derive(Debug, Default)]
-pub struct fuse_create_out {
-	pub entry: fuse_entry_out,
-	pub open: fuse_open_out,
-}
-unsafe impl FuseOut for fuse_create_out {}
-
-impl fuse_create_in {
-	fn new(name: &str, flags: u32, mode: u32) -> Self {
-		Self {
-			flags,
-			mode,
-			umask: 0,
-			padding: 0,
-			name: str_to_path(name),
-		}
-	}
-}
-
-impl fmt::Debug for fuse_create_in {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(
-			f,
-			"fuse_create_in {{ flags: {}, mode: {}, umask: {}, name: {:?} ...}}",
-			self.flags,
-			self.mode,
-			self.umask,
-			&self.name[..10]
-		)
-	}
-}
-
-pub fn create_create(
-	path: &str,
-	flags: u32,
-	mode: u32,
-) -> (Cmd<fuse_create_in>, Rsp<fuse_create_out>) {
-	let cmd = fuse_create_in::new(path, flags, mode);
-	let mut cmdhdr = create_in_header::<fuse_create_in>(Opcode::FUSE_CREATE);
-	cmdhdr.nodeid = FUSE_ROOT_ID;
-	let rsp = Default::default();
-	let rsphdr = Default::default();
-	(
-		Cmd {
-			cmd,
-			header: cmdhdr,
-			extra_buffer: FuseData(None),
-		},
-		Rsp {
-			rsp,
-			header: rsphdr,
-			extra_buffer: FuseData(None),
-		},
-	)
-}
-
-pub const FUSE_SETUPMAPPING_ENTRIES: u64 = 8;
-pub const FUSE_SETUPMAPPING_FLAG_WRITE: u64 = 1 << 0;
-pub const FUSE_SETUPMAPPING_FLAG_READ: u64 = 1 << 1;
-#[repr(C)]
-#[derive(Debug, Default)]
-pub struct fuse_setupmapping_in {
-	pub fh: u64,
-	pub foffset: u64,
-	pub len: u64,
-	pub flags: u64,
-	pub moffset: u64,
-}
-unsafe impl FuseIn for fuse_setupmapping_in {}
-
-#[repr(C)]
-#[derive(Debug, Default)]
-pub struct fuse_setupmapping_out {
-	pub something1: [u8; 32],
-	pub something2: [u8; 32],
-	pub something3: [u8; 32],
-}
-unsafe impl FuseOut for fuse_setupmapping_out {}
-
-pub fn create_setupmapping(
-	fh: u64,
-	foffset: u64,
-	len: u64,
-	flags: u64,
-	moffset: u64,
-) -> (Cmd<fuse_setupmapping_in>, Rsp<fuse_setupmapping_out>) {
-	let cmd: fuse_setupmapping_in = fuse_setupmapping_in {
-		fh,
-		foffset,
-		len,
-		flags,
-		moffset,
-	};
-	let mut cmdhdr = create_in_header::<fuse_setupmapping_in>(Opcode::FUSE_SETUPMAPPING);
-	cmdhdr.nodeid = core::u64::MAX; // -1
-	let rsp = Default::default();
-	let rsphdr = Default::default();
-	(
-		Cmd {
-			cmd,
-			header: cmdhdr,
-			extra_buffer: FuseData(None),
-		},
-		Rsp {
-			rsp,
-			header: rsphdr,
-			extra_buffer: FuseData(None),
-		},
-	)
-}
-
-#[repr(C, packed)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct fuse_removemapping_in {
-	pub count: u32,
-}
-unsafe impl FuseIn for fuse_removemapping_in {}
-
-#[repr(C)]
-#[derive(Debug, Default)]
-pub struct fuse_removemapping_out {}
-unsafe impl FuseOut for fuse_removemapping_out {}
-
-#[repr(C)]
-#[derive(Debug, Default)]
-pub struct fuse_removemapping_one {
-	pub moffset: u64,
-	pub len: u64,
-}
-
-pub fn create_removemapping(
-	nid: u64,
-	mappings: &Vec<fuse_removemapping_one>,
-) -> (Cmd<fuse_removemapping_in>, Rsp<fuse_removemapping_out>) {
-	let cmd: fuse_removemapping_in = fuse_removemapping_in {
-		count: mappings.len() as u32,
-	};
-	let mut cmdhdr = create_in_header::<fuse_removemapping_in>(Opcode::FUSE_REMOVEMAPPING);
-	cmdhdr.nodeid = nid;
-	let rsp = Default::default();
-
-	// Get u8buf of Vec
-	// TODO: create an interface that allows this without copying.
-	let byte_ptr = mappings.as_ptr() as *const u8;
-	let byte_len = mappings.len() * core::mem::size_of::<fuse_removemapping_one>();
-	let byte_arr = unsafe { core::slice::from_raw_parts(byte_ptr, byte_len) };
-	let extra = Vec::from(byte_arr);
-
-	let rsphdr = Default::default();
-	(
-		Cmd {
-			cmd,
-			header: cmdhdr,
-			extra_buffer: FuseData(Some(extra)),
 		},
 		Rsp {
 			rsp,
