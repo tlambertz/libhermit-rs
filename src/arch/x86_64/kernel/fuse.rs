@@ -244,7 +244,7 @@ impl<T: FuseInterface> FuseFile<T> {
 		trace!("read_dax({:x}) from offset {:x}", buf.len(), self.offset);
 		let mut cached = self.get_cached()?.clone();
 		let cached = cached.as_buf(self.offset as u64);
-
+		trace!("Got dax cache as {:p}", cached.as_ptr());
 		// Limit read length to buffer boundary
 		let mut len = buf.len();
 		if cached.len() < len {
@@ -266,9 +266,19 @@ impl<T: FuseInterface> FuseFile<T> {
 
 		// Copy buffer into output.
 		let read_bytes = len;
+		trace!(
+			"Starting dax copy. {:p}, {:#x}, {:p}, {:#x}",
+			buf.as_ptr(),
+			buf.len(),
+			cached.as_ptr(),
+			cached.len()
+		);
 		buf[..read_bytes].copy_from_slice(&cached[..len]);
 
-		trace!("read_dax output: {:?}", &buf[..read_bytes]);
+		trace!(
+			"read_dax output: {:?} ....",
+			&buf[..core::cmp::min(16, buf.len())]
+		);
 		Ok(read_bytes as u64)
 	}
 
@@ -369,15 +379,19 @@ impl<T: FuseInterface> FuseFile<T> {
 			if self.writable() {
 				flags |= FUSE_SETUPMAPPING_FLAG_WRITE;
 			}
+			// always allocate aligned blocks, so we never have a duplicate mapping
+			let foffset = align_down!(self.offset as u64, FUSE_DAX_MEM_RANGE_SZ);
 			let (cmd, rsp) = create_setupmapping(
 				fh,
-				self.offset as u64,
+				foffset,
 				FUSE_DAX_MEM_RANGE_SZ as u64,
 				flags,
 				entry.get_moffset(),
 			);
 			let rsp = self.driver.send_command(cmd, Some(rsp));
 			// TODO: check for errors. mapping might have failed.
+
+			trace!("Mapped new dax entry {:?}", entry);
 			Ok(entry)
 		} else {
 			warn!("File not open, cannot use dax!");
