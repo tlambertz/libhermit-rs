@@ -322,8 +322,6 @@ impl<T: FuseInterface> FuseFile<T> {
 	fn write_dax(&mut self, buf: &[u8]) -> Result<u64, FileError> {
 		let mut len = buf.len() as usize;
 
-		trace!("write_dax({:x}) from offset {:x}", len, self.offset);
-
 		// If write is file-extending, fall back to write_fuse()
 		if self.offset + len > self.attr.size as usize {
 			trace!(
@@ -334,6 +332,13 @@ impl<T: FuseInterface> FuseFile<T> {
 			);
 			return self.write_fuse(buf);
 		}
+
+		trace!(
+			"write_dax({:x}) from offset {:x} [{:x}]",
+			len,
+			self.offset,
+			self.attr.size
+		);
 
 		let mut cached = self.get_cached()?.clone();
 		let cached = cached.as_buf(self.offset as u64);
@@ -460,6 +465,43 @@ impl<T: FuseInterface> PosixFile for FuseFile<T> {
 		}
 
 		Ok(self.offset)
+	}
+
+	fn fsync(&mut self) -> Result<(), FileError> {
+		debug!("fuse fsync");
+		//Err(FileError::ENOSYS())
+
+		let cmd = fuse_fsync_in {
+			fh: self.fuse_fh.unwrap(), // TODO: error.
+			fsync_flags: 0,
+			padding: 0,
+		};
+		let mut cmdhdr = create_in_header::<fuse_fsync_in>(Opcode::FUSE_FSYNC);
+
+		let rsp = fuse_fsync_out {};
+		let rsphdr: fuse_out_header = Default::default();
+
+		cmdhdr.nodeid = self.fuse_nid.unwrap(); // TODO: error.
+
+		let rsp: fuse_entry_out = Default::default();
+
+		let _rsp = self
+			.driver
+			.send_command(
+				Cmd {
+					cmd,
+					header: cmdhdr,
+					extra_buffer: FuseData(None),
+				},
+				Some(Rsp {
+					rsp,
+					header: rsphdr,
+					extra_buffer: FuseData(None),
+				}),
+			)
+			.unwrap();
+
+		Ok(())
 	}
 }
 

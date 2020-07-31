@@ -375,4 +375,20 @@ pub trait SyscallInterface: Send + Sync {
 		info!("stat is unimplemented");
 		-ENOSYS
 	}
+
+	fn fsync(&self, fd: i32) -> i32 {
+		debug!("fsync! {}", fd);
+
+		let mut fs = fs::FILESYSTEM.lock();
+		let mut ret = 0;
+		fs.fd_op(fd as u64, |file| {
+			if let Err(_e) = file.unwrap().fsync() {
+				ret = -ENOSYS; // TODO: proper code
+			} else {
+				ret = 0;
+			}
+		});
+
+		ret
+	}
 }
