@@ -197,6 +197,11 @@ pub trait PosixFile {
 	fn read(&mut self, buf: &mut [u8]) -> Result<u64, FileError>;
 	fn write(&mut self, buf: &[u8]) -> Result<u64, FileError>;
 	fn lseek(&mut self, offset: isize, whence: SeekWhence) -> Result<usize, FileError>;
+
+	fn fsync(&mut self) -> Result<(), FileError> {
+		info!("fsync is unimplemented");
+		Err(FileError::ENOSYS())
+	}
 }
 
 /// File stat. Currently 1:1 fuse stats

@@ -536,3 +536,20 @@ pub struct fuse_removemapping_one {
 	pub moffset: u64,
 	pub len: u64,
 }
+
+
+// FUSE_FSYNC_FDATASYNC: Sync data only, not metadata
+pub const FUSE_FSYNC_FDATASYNC: u64 = 1 << 0;
+#[repr(C)]
+#[derive(Default, Debug)]
+pub struct fuse_fsync_in {
+	pub fh: u64,
+	pub fsync_flags: u32,
+	pub padding: u32,
+}
+unsafe impl FuseIn for fuse_fsync_in {}
+
+#[repr(C)]
+#[derive(Default, Debug)]
+pub struct fuse_fsync_out {}
+unsafe impl FuseOut for fuse_fsync_out {}

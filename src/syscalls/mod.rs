@@ -232,3 +232,12 @@ fn __sys_stat(file: *const u8, st: usize) -> i32 {
 pub extern "C" fn sys_stat(file: *const u8, st: usize) -> i32 {
 	kernel_function!(__sys_stat(file, st))
 }
+
+fn __sys_fsync(file: i32) -> i32 {
+	unsafe { SYS.fsync(file) }
+}
+
+#[no_mangle]
+pub extern "C" fn sys_fsync(file: i32) -> i32 {
+	kernel_function!(__sys_fsync(file))
+}
