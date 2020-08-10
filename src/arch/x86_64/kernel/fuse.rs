@@ -84,23 +84,23 @@ impl<T: FuseInterface + 'static> PosixFileSystem for Fuse<T> {
 		// Differentiate between opening and creating new file, since fuse does not support O_CREAT on open.
 		if !perms.creat {
 			// 2.FUSE_LOOKUP(FUSE_ROOT_ID, “foo”) -> nodeid
-			let entry = self.lookup(path);
+			let entry = self.lookup(path)?;
 
-			if let Some(entry) = entry {
-				fuse_nid = entry.nodeid;
-				fuse_attr = entry.attr;
-			} else {
-				warn!("Fuse lookup seems to have failed!");
-				return Err(FileError::ENOENT());
-			}
+			fuse_nid = entry.nodeid;
+			fuse_attr = entry.attr;
+			
 			// 3.FUSE_OPEN(nodeid, O_RDONLY) -> fh
 			let (cmd, rsp) = create_open(fuse_nid, perms.raw);
 			let rsp = self.driver.send_command(cmd, Some(rsp));
 			trace!("Open answer {:?}", rsp);
 			fuse_fh = Some(rsp.unwrap().rsp.fh);
 		} else {
-			// Create file (opens implicitly, returns results from both lookup and open calls)
-			let (cmd, rsp) = create_create(path, perms.raw, perms.mode);
+			// Create file. First look up parent.
+			let (filename, parentid) = self.get_parent_id(path)?;
+
+			// Create file as child in folder
+			// (opens implicitly, returns results from both lookup and open calls)
+			let (cmd, rsp) = create_create(parentid, filename, perms.raw, perms.mode);
 			let rsp = self.driver
 				.send_command(cmd, Some(rsp))
 				.unwrap();
@@ -128,7 +128,22 @@ impl<T: FuseInterface + 'static> PosixFileSystem for Fuse<T> {
 	}
 
 	fn unlink(&self, path: &str) -> core::result::Result<(), FileError> {
-		let (cmd, rsp) = create_unlink(path);
+		let (filename, parentid) = self.get_parent_id(path)?;
+
+		let mut cmdhdr = create_in_header::<fuse_unlink_in>(Opcode::FUSE_UNLINK);
+		cmdhdr.nodeid = parentid;
+		
+		let cmd: Cmd<fuse_unlink_in> = Cmd {
+			cmd: filename.into(),
+			header: cmdhdr,
+			extra_buffer: FuseData(None),
+		};
+		let rsp: Rsp<fuse_unlink_out> = Rsp {
+			rsp: Default::default(),
+			header: Default::default(),
+			extra_buffer: FuseData(None),
+		};
+		
 		let rsp = self.driver.send_command(cmd, Some(rsp));
 		trace!("unlink answer {:?}", rsp);
 
@@ -136,28 +151,26 @@ impl<T: FuseInterface + 'static> PosixFileSystem for Fuse<T> {
 	}
 
 	fn stat(&self, filename: &str) -> Result<fs::Stat, FileError> {
-		if let Some(feo) = self.lookup(filename) {
-			Ok(fs::Stat {
-				ino: feo.attr.ino,
-				size: feo.attr.size,
-				blocks: feo.attr.blocks,
-				atime: feo.attr.atime,
-				mtime: feo.attr.mtime,
-				ctime: feo.attr.ctime,
-				atimensec: feo.attr.atimensec,
-				mtimensec: feo.attr.mtimensec,
-				ctimensec: feo.attr.ctimensec,
-				mode: feo.attr.mode,
-				nlink: feo.attr.nlink,
-				uid: feo.attr.uid,
-				gid: feo.attr.gid,
-				rdev: feo.attr.rdev,
-				blksize: feo.attr.blksize,
-				padding: feo.attr.padding,
-			})
-		} else {
-			Err(FileError::ENOENT())
-		}
+		let feo = self.lookup(filename)?;
+
+		Ok(fs::Stat {
+			ino: feo.attr.ino,
+			size: feo.attr.size,
+			blocks: feo.attr.blocks,
+			atime: feo.attr.atime,
+			mtime: feo.attr.mtime,
+			ctime: feo.attr.ctime,
+			atimensec: feo.attr.atimensec,
+			mtimensec: feo.attr.mtimensec,
+			ctimensec: feo.attr.ctimensec,
+			mode: feo.attr.mode,
+			nlink: feo.attr.nlink,
+			uid: feo.attr.uid,
+			gid: feo.attr.gid,
+			rdev: feo.attr.rdev,
+			blksize: feo.attr.blksize,
+			padding: feo.attr.padding,
+		})
 	}
 }
 
@@ -195,8 +208,56 @@ impl<T: FuseInterface + 'static> Fuse<T> {
 		}));
 	}
 
-	pub fn lookup(&self, name: &str) -> Option<fuse_entry_out> {
-		let (cmd, rsp) = create_lookup(name);
+	/// Splits path at `/`, looks up the parents fuse id, returns it and the split filename.
+	fn get_parent_id<'a>(&self, path: &'a str) -> Result<(&'a str, u64), FileError> {
+		// Split path into name and folder.
+		let mut pathiter = path.rsplitn(2,'/');
+		let filename = match pathiter.next() {
+			Some(x) => x,
+			None => return Err(FileError::ENOENT())
+		};
+		let parentname = pathiter.next();
+
+		// Look up folder id
+		let parentid = if let Some(parentname) = parentname {
+			self.lookup(parentname)?.nodeid
+		} else {
+			FUSE_ROOT_ID
+		};
+
+		Ok((filename, parentid))
+	}
+
+	/// Do recursive lookup of filename. Split at `/`. Returns lookup entry of leaf file.
+	pub fn lookup(&self, name: &str) -> Result<fuse_entry_out, FileError> {
+		let mut parent = FUSE_ROOT_ID;
+		let mut last = Err(FileError::ENOENT()) ;
+		for part in name.split('/') {
+			if let Some(rsp) = self.lookup_single(part, parent) {
+				parent = rsp.nodeid;
+				last = Ok(rsp);
+			} else {
+				// Path element not found, early return none.
+				return Err(FileError::ENOENT());
+			}
+		}
+		last
+	}
+
+	/// Do single lookup of filename from fuse root_nid. name must not contain `/`.
+	pub fn lookup_single(&self, name: &str, root_nid: u64) -> Option<fuse_entry_out> {
+		let mut cmdhdr = create_in_header::<fuse_lookup_in>(Opcode::FUSE_LOOKUP);
+		cmdhdr.nodeid = root_nid;
+		let cmd: Cmd<fuse_lookup_in> = Cmd {
+			cmd: name.into(),
+			header: cmdhdr,
+			extra_buffer: FuseData(None),
+		};
+		let rsp = Rsp {
+			rsp: Default::default(),
+			header: Default::default(),
+			extra_buffer: FuseData(None),
+		};
 		let rsp = self.driver.send_command(cmd, Some(rsp));
 		Some(rsp.unwrap().rsp)
 	}
@@ -549,35 +610,16 @@ pub fn create_removemapping(
 }
 
 pub fn create_create(
+	fuse_nid: u64,
 	path: &str,
 	flags: u32,
 	mode: u32,
 ) -> (Cmd<fuse_create_in>, Rsp<fuse_create_out>) {
 	let cmd = fuse_create_in::new(path, flags, mode);
 	let mut cmdhdr = create_in_header::<fuse_create_in>(Opcode::FUSE_CREATE);
-	cmdhdr.nodeid = FUSE_ROOT_ID;
+	cmdhdr.nodeid = fuse_nid;
 	let rsp = Default::default();
 	let rsphdr = Default::default();
-	(
-		Cmd {
-			cmd,
-			header: cmdhdr,
-			extra_buffer: FuseData(None),
-		},
-		Rsp {
-			rsp,
-			header: rsphdr,
-			extra_buffer: FuseData(None),
-		},
-	)
-}
-
-pub fn create_unlink(name: &str) -> (Cmd<fuse_unlink_in>, Rsp<fuse_unlink_out>) {
-	let cmd = name.into();
-	let mut cmdhdr = create_in_header::<fuse_unlink_in>(Opcode::FUSE_UNLINK);
-	cmdhdr.nodeid = FUSE_ROOT_ID;
-	let rsp: fuse_unlink_out = Default::default();
-	let rsphdr: fuse_out_header = Default::default();
 	(
 		Cmd {
 			cmd,
@@ -751,26 +793,6 @@ pub fn create_init() -> (Cmd<fuse_init_in>, Rsp<fuse_init_out>) {
 	};
 	let cmdhdr = create_in_header::<fuse_init_in>(Opcode::FUSE_INIT);
 	let rsp: fuse_init_out = Default::default();
-	let rsphdr: fuse_out_header = Default::default();
-	(
-		Cmd {
-			cmd,
-			header: cmdhdr,
-			extra_buffer: FuseData(None),
-		},
-		Rsp {
-			rsp,
-			header: rsphdr,
-			extra_buffer: FuseData(None),
-		},
-	)
-}
-
-pub fn create_lookup(name: &str) -> (Cmd<fuse_lookup_in>, Rsp<fuse_entry_out>) {
-	let cmd = name.into();
-	let mut cmdhdr = create_in_header::<fuse_lookup_in>(Opcode::FUSE_LOOKUP);
-	cmdhdr.nodeid = FUSE_ROOT_ID;
-	let rsp: fuse_entry_out = Default::default();
 	let rsphdr: fuse_out_header = Default::default();
 	(
 		Cmd {
