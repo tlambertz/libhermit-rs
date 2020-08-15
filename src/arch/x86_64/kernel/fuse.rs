@@ -18,11 +18,16 @@ use core::{u32, u8};
 // op in/out sizes/layout: https://github.com/hanwen/go-fuse/blob/204b45dba899dfa147235c255908236d5fde2d32/fuse/opcode.go#L439
 // possible reponses for command: qemu/tools/virtiofsd/fuse_lowlevel.h
 
+const FUSE_ENOENT_ID: u64 = 0;
 const FUSE_ROOT_ID: u64 = 1;
 const MAX_BUFFER_SIZE: usize = 0x1000 * 256;
 
 pub trait FuseInterface {
-	fn send_recv_buffers_blocking(&mut self, to_host: &[&[u8]], from_host: &[&mut [u8]]);
+	fn send_recv_buffers_blocking(
+		&mut self,
+		to_host: &[&[u8]],
+		from_host: &[&mut [u8]],
+	) -> Result<(), ()>;
 }
 
 /// Driver which can easily be copied into a FuseFile
@@ -30,33 +35,50 @@ pub trait FuseInterface {
 struct FuseDriver<T: FuseInterface>(Rc<RefCell<T>>);
 
 impl<T: FuseInterface> FuseDriver<T> {
-	/// Send a command via the fuse driver with optional response.
-	/// Blocking, only returns once reply is available!
-	pub fn send_command<S, R>(&self, cmd: Cmd<S>, rsp: Option<Rsp<R>>) -> Option<Rsp<R>>
+	/// Send a command via the fuse driver and get the response.
+	/// Since responses can have different sizes, they are preallcoated by the caller.
+	/// Ownership is passed, and returned when the request is completed.
+	/// This call is blocking and only returns once the reply is available.
+	pub fn handle_request<S, R>(&self, cmd: Cmd<S>, mut rsp: Rsp<R>) -> Result<Rsp<R>, FileError>
 	where
 		S: FuseIn + core::fmt::Debug,
 		R: FuseOut + core::fmt::Debug,
 	{
-		// TODO: cmd/rsp gets deallocated when leaving scope.. maybe not the best idea for DMA, but PoC works with this
-		//       since we are blocking until done anyways.
-
 		trace!("Sending Fuse Command: {:?}", cmd);
 
+		// Convert buffers to raw u8 slices so the backend can handle them.
+		let to_host = cmd.as_u8bufs();
+		let from_host = rsp.as_u8bufs_mut();
+
+		// Send the buffers
+		self.0
+			.borrow_mut()
+			.send_recv_buffers_blocking(&to_host, &from_host)
+			.map_err(|_| FileError::EIO)?;
+
+		// Got reply, return
+		trace!("Got Fuse Reply: {:?}", rsp);
+		Ok(rsp)
+	}
+
+	/// Send a command via the fuse driver, which does not expect a response.
+	/// This call is blocking and returns once the receiver has acknowledged receiving the command.
+	#[allow(dead_code)]
+	pub fn send_command<S, R>(&self, cmd: Cmd<S>) -> Result<(), FileError>
+	where
+		S: FuseIn + core::fmt::Debug,
+		R: FuseOut + core::fmt::Debug,
+	{
+		trace!("Sending Fuse Command: {:?}", cmd);
+
+		// Convert buffers to raw u8 slices so the backend can handle them.
 		let to_host = cmd.as_u8bufs();
 
-		if let Some(mut rsp) = rsp {
-			let from_host = rsp.as_u8bufs_mut();
-			self.0
-				.borrow_mut()
-				.send_recv_buffers_blocking(&to_host, &from_host);
-			trace!("Got Fuse Reply: {:?}", rsp);
-			Some(rsp)
-		} else {
-			self.0
-				.borrow_mut()
-				.send_recv_buffers_blocking(&to_host, &[]);
-			None
-		}
+		// Send the buffers
+		self.0
+			.borrow_mut()
+			.send_recv_buffers_blocking(&to_host, &[])
+			.map_err(|_| FileError::EIO)
 	}
 
 	/// #derive[Clone] does not work because of https://github.com/rust-lang/rust/issues/41481
@@ -94,9 +116,9 @@ impl<T: FuseInterface + 'static> PosixFileSystem for Fuse<T> {
 
 			// 3.FUSE_OPEN(nodeid, O_RDONLY) -> fh
 			let (cmd, rsp) = create_open(fuse_nid, perms.raw);
-			let rsp = self.driver.send_command(cmd, Some(rsp));
+			let rsp = self.driver.handle_request(cmd, rsp)?;
 			trace!("Open answer {:?}", rsp);
-			fuse_fh = Some(rsp.unwrap().rsp.fh);
+			fuse_fh = Some(rsp.rsp.fh);
 		} else {
 			// Create file. First look up parent.
 			let (filename, parentid) = self.get_parent_id(path)?;
@@ -104,7 +126,7 @@ impl<T: FuseInterface + 'static> PosixFileSystem for Fuse<T> {
 			// Create file as child in folder
 			// (opens implicitly, returns results from both lookup and open calls)
 			let (cmd, rsp) = create_create(parentid, filename, perms.raw, perms.mode);
-			let rsp = self.driver.send_command(cmd, Some(rsp)).unwrap();
+			let rsp = self.driver.handle_request(cmd, rsp)?;
 			trace!("Create answer {:?}", rsp);
 
 			fuse_nid = rsp.rsp.entry.nodeid;
@@ -145,7 +167,7 @@ impl<T: FuseInterface + 'static> PosixFileSystem for Fuse<T> {
 			extra_buffer: FuseData(None),
 		};
 
-		let rsp = self.driver.send_command(cmd, Some(rsp));
+		let rsp = self.driver.handle_request(cmd, rsp)?;
 		trace!("unlink answer {:?}", rsp);
 
 		Ok(())
@@ -194,10 +216,10 @@ impl<T: FuseInterface + 'static> Fuse<T> {
 
 	pub fn send_init(&mut self) {
 		let (cmd, rsp) = create_init();
-		let rsp = self.driver.send_command(cmd, Some(rsp));
+		let rsp = self.driver.handle_request(cmd, rsp);
 		trace!("fuse init answer: {:?}", rsp);
 
-		let bufsize = if let Some(rsp) = rsp {
+		let bufsize = if let Ok(rsp) = rsp {
 			core::cmp::min(rsp.rsp.max_write as usize, MAX_BUFFER_SIZE)
 		} else {
 			error!("Fuse initialization failed!");
@@ -215,7 +237,7 @@ impl<T: FuseInterface + 'static> Fuse<T> {
 		let mut pathiter = path.rsplitn(2, '/');
 		let filename = match pathiter.next() {
 			Some(x) => x,
-			None => return Err(FileError::ENOENT()),
+			None => return Err(FileError::ENOENT),
 		};
 		let parentname = pathiter.next();
 
@@ -229,24 +251,25 @@ impl<T: FuseInterface + 'static> Fuse<T> {
 		Ok((filename, parentid))
 	}
 
-	/// Do recursive lookup of filename. Split at `/`. Returns lookup entry of leaf file.
+	/// Do recursive lookup of absolute path (omit the leading `/`). Split at `/`.
+	/// Returns lookup entry of leaf file if it exists.
 	pub fn lookup(&self, name: &str) -> Result<fuse_entry_out, FileError> {
+		// All lookups start at root node
 		let mut parent = FUSE_ROOT_ID;
-		let mut last = Err(FileError::ENOENT());
+		// Rust does not realize we always iterate at least once, so init with ENOENT
+		let mut leaf = Err(FileError::ENOENT);
 		for part in name.split('/') {
-			if let Some(rsp) = self.lookup_single(part, parent) {
-				parent = rsp.nodeid;
-				last = Ok(rsp);
-			} else {
-				// Path element not found, early return none.
-				return Err(FileError::ENOENT());
-			}
+			let entry = self.lookup_single(part, parent)?;
+			parent = entry.nodeid;
+			leaf = Ok(entry);
 		}
-		last
+		leaf
 	}
 
 	/// Do single lookup of filename from fuse root_nid. name must not contain `/`.
-	pub fn lookup_single(&self, name: &str, root_nid: u64) -> Option<fuse_entry_out> {
+	/// Returns ENOENT if the file does not exist.
+	pub fn lookup_single(&self, name: &str, root_nid: u64) -> Result<fuse_entry_out, FileError> {
+		trace!("Lookup for {}", name);
 		let mut cmdhdr = create_in_header::<fuse_lookup_in>(Opcode::FUSE_LOOKUP);
 		cmdhdr.nodeid = root_nid;
 		let cmd: Cmd<fuse_lookup_in> = Cmd {
@@ -254,13 +277,19 @@ impl<T: FuseInterface + 'static> Fuse<T> {
 			header: cmdhdr,
 			extra_buffer: FuseData(None),
 		};
-		let rsp = Rsp {
+		let rsp: Rsp<fuse_entry_out> = Rsp {
 			rsp: Default::default(),
 			header: Default::default(),
 			extra_buffer: FuseData(None),
 		};
-		let rsp = self.driver.send_command(cmd, Some(rsp));
-		Some(rsp.unwrap().rsp)
+		let rsp = self.driver.handle_request(cmd, rsp)?;
+		trace!("result: {:?}", rsp);
+		if rsp.rsp.nodeid == FUSE_ENOENT_ID {
+			// nodeid == 0 is the same as -ENOENT
+			return Err(FileError::ENOENT);
+		}
+		// File exists, return attributes
+		Ok(rsp.rsp)
 	}
 }
 
@@ -285,8 +314,7 @@ impl<T: FuseInterface> FuseFile<T> {
 		}
 		if let Some(fh) = self.fuse_fh {
 			let (cmd, rsp) = create_read(fh, len as u32, self.offset as u64);
-			let rsp = self.driver.send_command(cmd, Some(rsp));
-			let rsp = rsp.unwrap();
+			let rsp = self.driver.handle_request(cmd, rsp)?;
 			let len = rsp.header.len as usize - ::core::mem::size_of::<fuse_out_header>();
 			self.offset += len;
 			// TODO: do this zerocopy
@@ -296,15 +324,15 @@ impl<T: FuseInterface> FuseFile<T> {
 			Ok(vec)
 		} else {
 			warn!("File not open, cannot read!");
-			Err(FileError::ENOENT())
+			Err(FileError::ENOENT)
 		}
 	}
 
 	/// Uses fuse setupmapping to create a DAX mapping, and copies from that. Mappings are cached
-	fn read_dax(&mut self, buf: &mut [u8]) -> Result<u64, FileError> {
+	fn read_dax(&mut self, buf: &mut [u8]) -> Result<usize, FileError> {
 		trace!("read_dax({:x}) from offset {:x}", buf.len(), self.offset);
 		let mut cached = self.get_cached()?.clone();
-		let cached = cached.as_buf(self.offset as u64);
+		let cached = cached.as_buf(self.offset);
 		trace!("Got dax cache as {:p}", cached.as_ptr());
 		// Limit read length to buffer boundary
 		let mut len = buf.len();
@@ -355,9 +383,8 @@ impl<T: FuseInterface> FuseFile<T> {
 		}
 		if let Some(fh) = self.fuse_fh {
 			let (cmd, rsp) = create_write(fh, &buf[..len], self.offset as u64);
-			let rsp = self.driver.send_command(cmd, Some(rsp));
+			let rsp = self.driver.handle_request(cmd, rsp)?;
 			trace!("write response: {:?}", rsp);
-			let rsp = rsp.unwrap();
 
 			let len = rsp.rsp.size as usize;
 			self.offset += len;
@@ -373,14 +400,14 @@ impl<T: FuseInterface> FuseFile<T> {
 				self.attr.size = self.offset as u64;
 			}
 			debug!("Written {} bytes", len);
-			Ok(len as u64)
+			Ok(len)
 		} else {
 			warn!("File not open, cannot read!");
-			Err(FileError::ENOENT())
+			Err(FileError::ENOENT)
 		}
 	}
 
-	fn write_dax(&mut self, buf: &[u8]) -> Result<u64, FileError> {
+	fn write_dax(&mut self, buf: &[u8]) -> Result<usize, FileError> {
 		let mut len = buf.len() as usize;
 
 		// If write is file-extending, fall back to write_fuse()
@@ -402,7 +429,7 @@ impl<T: FuseInterface> FuseFile<T> {
 		);
 
 		let mut cached = self.get_cached()?.clone();
-		let cached = cached.as_buf(self.offset as u64);
+		let cached = cached.as_buf(self.offset);
 
 		// Limit write length to buffer boundary
 		if cached.len() < len {
@@ -420,7 +447,7 @@ impl<T: FuseInterface> FuseFile<T> {
 		);
 		cached[..len].copy_from_slice(buf);
 
-		Ok(len as u64)
+		Ok(len)
 	}
 
 	/// Returns true if the file is opened with write flag
@@ -438,7 +465,7 @@ impl<T: FuseInterface> FuseFile<T> {
 
 		// Offset is not yet mapped, do it now!
 		let entry = cache
-			.alloc_cache(self.offset as u64)
+			.alloc_cache(self.offset)
 			.expect("Could not alloc DAX cache"); // TODO: free cache entry, try again
 		if let Some(fh) = self.fuse_fh {
 			let mut flags = FUSE_SETUPMAPPING_FLAG_READ;
@@ -454,14 +481,14 @@ impl<T: FuseInterface> FuseFile<T> {
 				flags,
 				entry.get_moffset(),
 			);
-			let rsp = self.driver.send_command(cmd, Some(rsp));
+			let _rsp = self.driver.handle_request(cmd, rsp)?;
 			// TODO: check for errors. mapping might have failed.
 
 			trace!("Mapped new dax entry {:?}", entry);
 			Ok(entry)
 		} else {
 			warn!("File not open, cannot use dax!");
-			Err(FileError::ENOENT())
+			Err(FileError::ENOENT)
 		}
 	}
 
@@ -480,7 +507,9 @@ impl<T: FuseInterface> FuseFile<T> {
 			}
 			trace!("Removing dax mappings {:?}", mappings);
 			let (cmd, rsp) = create_removemapping(self.fuse_nid.unwrap_or(0), &mappings);
-			let rsp = self.driver.send_command(cmd, Some(rsp));
+			if self.driver.handle_request(cmd, rsp).is_err() {
+				error!("Unmapping DAX failed. Continuing assuming it succeeded");
+			}
 
 			cache.free();
 		}
@@ -491,23 +520,23 @@ impl<T: FuseInterface> PosixFile for FuseFile<T> {
 	fn close(&mut self) -> Result<(), FileError> {
 		self.drop_cache();
 		let (cmd, rsp) = create_release(self.fuse_nid.unwrap(), self.fuse_fh.unwrap());
-		self.driver.send_command(cmd, Some(rsp));
+		self.driver.handle_request(cmd, rsp)?;
 
 		Ok(())
 	}
 
-	fn read(&mut self, buf: &mut [u8]) -> Result<u64, FileError> {
+	fn read(&mut self, buf: &mut [u8]) -> Result<usize, FileError> {
 		if self.dax_cache.is_some() {
 			self.read_dax(buf)
 		} else {
 			let read = self.read_fuse(buf)?;
 			let read_bytes = read.len();
 			buf[..read_bytes].copy_from_slice(&read);
-			Ok(read_bytes as u64)
+			Ok(read_bytes)
 		}
 	}
 
-	fn write(&mut self, buf: &[u8]) -> Result<u64, FileError> {
+	fn write(&mut self, buf: &[u8]) -> Result<usize, FileError> {
 		debug!("fuse write!");
 		if self.dax_cache.is_some() {
 			self.write_dax(buf)
@@ -530,7 +559,7 @@ impl<T: FuseInterface> PosixFile for FuseFile<T> {
 
 	fn fsync(&mut self) -> Result<(), FileError> {
 		debug!("fuse fsync");
-		//Err(FileError::ENOSYS())
+		//Err(FileError::ENOSYS)
 
 		let cmd = fuse_fsync_in {
 			fh: self.fuse_fh.unwrap(), // TODO: error.
@@ -544,23 +573,18 @@ impl<T: FuseInterface> PosixFile for FuseFile<T> {
 
 		cmdhdr.nodeid = self.fuse_nid.unwrap(); // TODO: error.
 
-		let rsp: fuse_entry_out = Default::default();
-
-		let _rsp = self
-			.driver
-			.send_command(
-				Cmd {
-					cmd,
-					header: cmdhdr,
-					extra_buffer: FuseData(None),
-				},
-				Some(Rsp {
-					rsp,
-					header: rsphdr,
-					extra_buffer: FuseData(None),
-				}),
-			)
-			.unwrap();
+		let _rsp = self.driver.handle_request(
+			Cmd {
+				cmd,
+				header: cmdhdr,
+				extra_buffer: FuseData(None),
+			},
+			Rsp {
+				rsp,
+				header: rsphdr,
+				extra_buffer: FuseData(None),
+			},
+		)?;
 
 		Ok(())
 	}
