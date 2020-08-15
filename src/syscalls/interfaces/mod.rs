@@ -116,6 +116,22 @@ fn open_flags_to_perm(flags: i32, mut mode: u32) -> FilePerms {
 	perms
 }
 
+/// Converts raw FileError into i32.
+/// This is part of the userspace facing syscall-api and thus done here rather than in the fs directly
+fn convert_fs_error(err: fs::FileError) -> i32 {
+	match err {
+		fs::FileError::EIO => -EIO,
+		fs::FileError::ENOENT => -ENOENT,
+		fs::FileError::ENOSYS => -ENOSYS,
+	}
+}
+
+/// Converts a filesystem result into the appropriate error-number if needed.
+fn convert_fs_result(res: Result<usize, fs::FileError>) -> isize {
+	res.and_then(|v| Ok(v as isize))
+		.unwrap_or_else(|e| convert_fs_error(e) as isize)
+}
+
 pub trait SyscallInterface: Send + Sync {
 	fn init(&self) {
 		// Interface-specific initialization steps.
@@ -224,11 +240,12 @@ pub trait SyscallInterface: Send + Sync {
 		let name = unsafe { util::c_str_to_str(name) };
 		debug!("unlink {}", name);
 
-		fs::FILESYSTEM
-			.lock()
-			.unlink(&name)
-			.expect("Unlinking failed!"); // TODO: error handling
-		0
+		let res = fs::FILESYSTEM.lock().unlink(&name);
+
+		match res {
+			Ok(()) => 0,
+			Err(e) => convert_fs_error(e),
+		}
 	}
 
 	#[cfg(not(target_arch = "x86_64"))]
@@ -281,12 +298,12 @@ pub trait SyscallInterface: Send + Sync {
 		let buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
 
 		let mut fs = fs::FILESYSTEM.lock();
-		let mut read_bytes = 0;
+		let mut read_bytes = Err(fs::FileError::ENOSYS);
 		fs.fd_op(fd as u64, |file| {
-			read_bytes = file.unwrap().read(buf).unwrap(); // TODO: might fail
+			read_bytes = file.unwrap().read(buf);
 		});
 
-		read_bytes as isize
+		convert_fs_result(read_bytes)
 	}
 
 	fn write(&self, fd: i32, buf: *const u8, len: usize) -> isize {
@@ -296,13 +313,13 @@ pub trait SyscallInterface: Send + Sync {
 			// Normal file
 			let buf = unsafe { slice::from_raw_parts(buf, len) };
 
-			let mut written_bytes = 0;
+			let mut written_bytes = Err(fs::FileError::ENOSYS);
 			let mut fs = fs::FILESYSTEM.lock();
 			fs.fd_op(fd as u64, |file| {
-				written_bytes = file.unwrap().write(buf).unwrap(); // TODO: might fail
+				written_bytes = file.unwrap().write(buf);
 			});
-			debug!("Write done! {}", written_bytes);
-			written_bytes as isize
+			debug!("Write done! {:?}", written_bytes);
+			convert_fs_result(written_bytes)
 		} else {
 			// stdin/err/out all go to console
 			unsafe {
@@ -321,15 +338,12 @@ pub trait SyscallInterface: Send + Sync {
 		debug!("lseek! {}, {}, {}", fd, offset, whence);
 
 		let mut fs = fs::FILESYSTEM.lock();
-		let mut ret = 0;
+		let mut ret = Err(fs::FileError::ENOSYS);
 		fs.fd_op(fd as u64, |file| {
-			ret = file
-				.unwrap()
-				.lseek(offset, whence.try_into().unwrap())
-				.unwrap(); // TODO: might fail
+			ret = file.unwrap().lseek(offset, whence.try_into().unwrap());
 		});
 
-		ret as isize
+		convert_fs_result(ret)
 	}
 
 	#[cfg(feature = "newlib")]
@@ -371,7 +385,7 @@ pub trait SyscallInterface: Send + Sync {
 	}
 
 	#[cfg(not(feature = "newlib"))]
-	fn stat(&self, _file: *const u8, _st: usize) -> i32 {
+	fn stat(&self, _file: *const u8, _st: usize) -> isize {
 		info!("stat is unimplemented");
 		-ENOSYS
 	}
@@ -380,15 +394,14 @@ pub trait SyscallInterface: Send + Sync {
 		debug!("fsync! {}", fd);
 
 		let mut fs = fs::FILESYSTEM.lock();
-		let mut ret = 0;
+		let mut ret = Err(fs::FileError::ENOSYS);
 		fs.fd_op(fd as u64, |file| {
-			if let Err(_e) = file.unwrap().fsync() {
-				ret = -ENOSYS; // TODO: proper code
-			} else {
-				ret = 0;
-			}
+			ret = file.unwrap().fsync();
 		});
 
-		ret
+		match ret {
+			Ok(()) => 0,
+			Err(e) => convert_fs_error(e),
+		}
 	}
 }
