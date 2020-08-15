@@ -101,7 +101,7 @@ impl Filesystem {
 		// assert start with / (no pwd relative!), split path at /, look first element. Determine backing fs. If non existent, -ENOENT
 		if !path.starts_with('/') {
 			warn!("Relative paths not allowed!");
-			return Err(FileError::ENOENT());
+			return Err(FileError::ENOENT);
 		}
 		let mut pathsplit = path.splitn(3, '/');
 		pathsplit.next(); // always empty, since first char is /
@@ -115,7 +115,7 @@ impl Filesystem {
 				"Trying to open file on non-existing mount point '{}'!",
 				mount
 			);
-			Err(FileError::ENOENT())
+			Err(FileError::ENOENT)
 		}
 	}
 
@@ -139,7 +139,7 @@ impl Filesystem {
 
 	/// Unlinks a file given by path
 	pub fn unlink(&mut self, path: &str) -> Result<(), FileError> {
-		info!("Unlinking file {}", path);
+		debug!("Unlinking file {}", path);
 		let (fs, internal_path) = self.parse_path(path)?;
 		fs.unlink(internal_path)?;
 		Ok(())
@@ -182,8 +182,9 @@ impl Filesystem {
 
 #[derive(Debug)]
 pub enum FileError {
-	ENOENT(),
-	ENOSYS(),
+	ENOENT,
+	ENOSYS,
+	EIO,
 }
 
 pub trait PosixFileSystem {
@@ -194,13 +195,13 @@ pub trait PosixFileSystem {
 
 pub trait PosixFile {
 	fn close(&mut self) -> Result<(), FileError>;
-	fn read(&mut self, buf: &mut [u8]) -> Result<u64, FileError>;
-	fn write(&mut self, buf: &[u8]) -> Result<u64, FileError>;
+	fn read(&mut self, buf: &mut [u8]) -> Result<usize, FileError>;
+	fn write(&mut self, buf: &[u8]) -> Result<usize, FileError>;
 	fn lseek(&mut self, offset: isize, whence: SeekWhence) -> Result<usize, FileError>;
 
 	fn fsync(&mut self) -> Result<(), FileError> {
 		info!("fsync is unimplemented");
-		Err(FileError::ENOSYS())
+		Err(FileError::ENOSYS)
 	}
 }
 

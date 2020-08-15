@@ -45,15 +45,15 @@ struct Slab {
 #[derive(Debug, Clone)]
 pub struct CacheEntry {
 	slab: Rc<RefCell<Slab>>,
-	file_offset: u64,
+	file_offset: usize,
 }
 
 impl CacheEntry {
-	pub fn as_buf(&mut self, file_offset: u64) -> &mut [u8] {
+	pub fn as_buf(&mut self, file_offset: usize) -> &mut [u8] {
 		let buf = unsafe {
 			core::slice::from_raw_parts_mut(self.slab.borrow().addr, FUSE_DAX_MEM_RANGE_SZ as usize)
 		};
-		&mut buf[(file_offset - self.file_offset) as usize..]
+		&mut buf[(file_offset - self.file_offset)..]
 	}
 
 	pub fn get_moffset(&self) -> u64 {
@@ -85,18 +85,18 @@ impl FuseDaxCache {
 	}
 
 	/// Allocates a new buffer for caching a file from file_offset. Always of size FUSE_DAX_MEM_RANGE_SZ (512 pages)
-	pub fn alloc_cache(&mut self, file_offset: u64) -> Result<CacheEntry, ()> {
+	pub fn alloc_cache(&mut self, file_offset: usize) -> Result<CacheEntry, ()> {
 		/*if align_down!(file_offset, FUSE_DAX_MEM_RANGE_SZ) != file_offset {
 			warn!("Could not allocate unaligned DAX slab!");
 			return Err(());
 		}*/
-		let file_offset = align_down!(file_offset, FUSE_DAX_MEM_RANGE_SZ);
+		let file_offset = align_down!(file_offset as u64, FUSE_DAX_MEM_RANGE_SZ);
 
 		let slab = self.allocator.borrow_mut().allocate()?;
 		{
 			trace!("Alloc'd slab for offset {} at {:p} [{:x}]", file_offset, slab.borrow().addr, slab.borrow().moffset);
 		}
-		let entry = CacheEntry { slab, file_offset };
+		let entry = CacheEntry { slab, file_offset: file_offset as usize };
 		self.entries.insert(file_offset as u64, entry.clone());
 		Ok(entry)
 	}

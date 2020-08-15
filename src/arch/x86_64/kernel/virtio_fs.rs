@@ -168,16 +168,15 @@ impl VirtioFsDriver<'_> {
 }
 
 impl FuseInterface for VirtioFsDriver<'_> {
-	fn send_recv_buffers_blocking(
+	fn send_recv_buffers_blocking (
 		&mut self,
 		to_host: &[&[u8]], from_host: &[&mut [u8]]
-	)
+	) -> Result<(), ()>
 	{
-		// TODO: cmd/rsp gets deallocated when leaving scope.. maybe not the best idea for DMA, but PoC works with this
-		//       since we are blocking until done anyways.
 		if let Some(ref mut vqueues) = self.vqueues {
 			vqueues[1].send_blocking(to_host, Some(from_host));
 		}
+		Ok(())
 	}
 
 	/* TODO: make TEST out of this!
