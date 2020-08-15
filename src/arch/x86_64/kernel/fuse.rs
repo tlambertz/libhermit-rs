@@ -5,6 +5,10 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
+// TODO:
+// - Parse errors from fuse-header and turn them into appropriate FileErrors
+// - implement more functions
+
 use super::fuse_dax::{CacheEntry, DaxAllocator, FuseDaxCache, FUSE_DAX_MEM_RANGE_SZ};
 use super::fuse_h::*;
 use crate::syscalls::fs::{self, FileError, FilePerms, PosixFile, PosixFileSystem, SeekWhence};
@@ -474,15 +478,13 @@ impl<T: FuseInterface> FuseFile<T> {
 			}
 			// always allocate aligned blocks, so we never have a duplicate mapping
 			let foffset = align_down!(self.offset as u64, FUSE_DAX_MEM_RANGE_SZ);
-			let (cmd, rsp) = create_setupmapping(
+			self.setupmapping(
 				fh,
 				foffset,
 				FUSE_DAX_MEM_RANGE_SZ as u64,
 				flags,
 				entry.get_moffset(),
-			);
-			let _rsp = self.driver.handle_request(cmd, rsp)?;
-			// TODO: check for errors. mapping might have failed.
+			)?;
 
 			trace!("Mapped new dax entry {:?}", entry);
 			Ok(entry)
@@ -492,10 +494,49 @@ impl<T: FuseInterface> FuseFile<T> {
 		}
 	}
 
+	fn setupmapping(
+		&mut self,
+		fh: u64,
+		foffset: u64,
+		len: u64,
+		flags: u64,
+		moffset: u64,
+	) -> Result<(), FileError> {
+		let cmd = fuse_setupmapping_in {
+			fh,
+			foffset,
+			len,
+			flags,
+			moffset,
+		};
+		let mut cmdhdr = create_in_header::<fuse_setupmapping_in>(Opcode::FUSE_SETUPMAPPING);
+		cmdhdr.nodeid = core::u64::MAX; // -1
+		let rsp: fuse_setupmapping_out = Default::default();
+		let rsphdr = Default::default();
+
+		let rsp = self.driver.handle_request(
+			Cmd {
+				cmd,
+				header: cmdhdr,
+				extra_buffer: FuseData(None),
+			},
+			Rsp {
+				rsp,
+				header: rsphdr,
+				extra_buffer: FuseData(None),
+			},
+		)?;
+
+		match rsp.header.error {
+			0 => Ok(()),
+			_ => Err(FileError::ENOSYS), // Just enosys for now. TODO
+		}
+	}
+
 	/// Drops all DAX mappings
 	fn drop_cache(&mut self) {
+		let mut mappings = Vec::new();
 		if let Some(cache) = &mut self.dax_cache {
-			let mut mappings = Vec::new();
 			cache.iterate_run(|_addr, entry| {
 				mappings.push(fuse_removemapping_one {
 					moffset: entry.get_moffset(),
@@ -505,13 +546,49 @@ impl<T: FuseInterface> FuseFile<T> {
 			if mappings.is_empty() {
 				return;
 			}
-			trace!("Removing dax mappings {:?}", mappings);
-			let (cmd, rsp) = create_removemapping(self.fuse_nid.unwrap_or(0), &mappings);
-			if self.driver.handle_request(cmd, rsp).is_err() {
-				error!("Unmapping DAX failed. Continuing assuming it succeeded");
-			}
+		}
 
+		trace!("Removing dax mappings {:?}", mappings);
+		self.removemapping(self.fuse_nid.unwrap_or(0), &mappings);
+
+		if let Some(cache) = &mut self.dax_cache {
 			cache.free();
+		}
+	}
+
+	fn removemapping(&mut self, nid: u64, mappings: &Vec<fuse_removemapping_one>) {
+		let cmd: fuse_removemapping_in = fuse_removemapping_in {
+			count: mappings.len() as u32,
+		};
+		let mut cmdhdr = create_in_header::<fuse_removemapping_in>(Opcode::FUSE_REMOVEMAPPING);
+		cmdhdr.nodeid = nid;
+		let rsp: fuse_removemapping_out = Default::default();
+
+		// Get u8buf of Vec
+		// TODO: create an interface that allows this without copying.
+		let byte_ptr = mappings.as_ptr() as *const u8;
+		let byte_len = mappings.len() * core::mem::size_of::<fuse_removemapping_one>();
+		let byte_arr = unsafe { core::slice::from_raw_parts(byte_ptr, byte_len) };
+		let extra = Vec::from(byte_arr);
+		let rsphdr = Default::default();
+
+		if self
+			.driver
+			.handle_request(
+				Cmd {
+					cmd,
+					header: cmdhdr,
+					extra_buffer: FuseData(Some(extra)),
+				},
+				Rsp {
+					rsp,
+					header: rsphdr,
+					extra_buffer: FuseData(None),
+				},
+			)
+			.is_err()
+		{
+			error!("Unmapping DAX failed. Continuing assuming it succeeded");
 		}
 	}
 }
@@ -588,71 +665,6 @@ impl<T: FuseInterface> PosixFile for FuseFile<T> {
 
 		Ok(())
 	}
-}
-
-pub fn create_setupmapping(
-	fh: u64,
-	foffset: u64,
-	len: u64,
-	flags: u64,
-	moffset: u64,
-) -> (Cmd<fuse_setupmapping_in>, Rsp<fuse_setupmapping_out>) {
-	let cmd: fuse_setupmapping_in = fuse_setupmapping_in {
-		fh,
-		foffset,
-		len,
-		flags,
-		moffset,
-	};
-	let mut cmdhdr = create_in_header::<fuse_setupmapping_in>(Opcode::FUSE_SETUPMAPPING);
-	cmdhdr.nodeid = core::u64::MAX; // -1
-	let rsp = Default::default();
-	let rsphdr = Default::default();
-	(
-		Cmd {
-			cmd,
-			header: cmdhdr,
-			extra_buffer: FuseData(None),
-		},
-		Rsp {
-			rsp,
-			header: rsphdr,
-			extra_buffer: FuseData(None),
-		},
-	)
-}
-
-pub fn create_removemapping(
-	nid: u64,
-	mappings: &Vec<fuse_removemapping_one>,
-) -> (Cmd<fuse_removemapping_in>, Rsp<fuse_removemapping_out>) {
-	let cmd: fuse_removemapping_in = fuse_removemapping_in {
-		count: mappings.len() as u32,
-	};
-	let mut cmdhdr = create_in_header::<fuse_removemapping_in>(Opcode::FUSE_REMOVEMAPPING);
-	cmdhdr.nodeid = nid;
-	let rsp = Default::default();
-
-	// Get u8buf of Vec
-	// TODO: create an interface that allows this without copying.
-	let byte_ptr = mappings.as_ptr() as *const u8;
-	let byte_len = mappings.len() * core::mem::size_of::<fuse_removemapping_one>();
-	let byte_arr = unsafe { core::slice::from_raw_parts(byte_ptr, byte_len) };
-	let extra = Vec::from(byte_arr);
-
-	let rsphdr = Default::default();
-	(
-		Cmd {
-			cmd,
-			header: cmdhdr,
-			extra_buffer: FuseData(Some(extra)),
-		},
-		Rsp {
-			rsp,
-			header: rsphdr,
-			extra_buffer: FuseData(None),
-		},
-	)
 }
 
 pub fn create_create(
