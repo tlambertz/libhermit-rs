@@ -10,7 +10,7 @@ use crate::arch::x86_64::kernel::pci;
 use crate::arch::x86_64::kernel::virtio::{
 	self, consts::*, virtio_pci_common_cfg, VirtioNotification, VirtioSharedMemory, Virtq,
 };
-use crate::syscalls::fs;
+use crate::syscalls::vfs;
 use crate::util;
 
 use super::fuse_dax::DaxAllocator;
@@ -311,7 +311,7 @@ pub fn create_virtiofs_driver(
 	// send FUSE_INIT to create session
 	fuse.send_init();
 
-	let mut fs = fs::FILESYSTEM.lock();
+	let mut fs = vfs::FILESYSTEM.lock();
 	let tag = util::c_buf_to_str(&device_cfg.tag);
 	info!("Mounting virtio-fs at /{}", tag);
 	fs.mount(tag, Box::new(fuse))

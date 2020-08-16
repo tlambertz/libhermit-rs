@@ -26,7 +26,7 @@ pub use self::tasks::*;
 pub use self::timer::*;
 
 mod condvar;
-pub mod fs;
+pub mod vfs;
 mod interfaces;
 #[cfg(feature = "newlib")]
 mod lwip;

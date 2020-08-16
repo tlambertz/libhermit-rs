@@ -10,7 +10,6 @@ use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
-use alloc::vec::Vec;
 use core::ops::Deref;
 
 /*
@@ -52,9 +51,9 @@ TODO:
 */
 
 // TODO: lazy static could be replaced with explicit init on OS boot.
-pub static FILESYSTEM: Spinlock<Filesystem> = Spinlock::new(Filesystem::new());
+pub static FILESYSTEM: Spinlock<VirtualFilesystem> = Spinlock::new(VirtualFilesystem::new());
 
-pub struct Filesystem {
+pub struct VirtualFilesystem {
 	// Keep track of mount-points
 	mounts: BTreeMap<String, Box<dyn PosixFileSystem>>,
 
@@ -62,7 +61,7 @@ pub struct Filesystem {
 	files: BTreeMap<u64, Box<dyn PosixFile>>,
 }
 
-impl Filesystem {
+impl VirtualFilesystem {
 	pub const fn new() -> Self {
 		Self {
 			mounts: BTreeMap::new(),
@@ -84,7 +83,7 @@ impl Filesystem {
 		}
 	}
 
-	/// Gets a new fd for a file and inserts it into open files.
+	/// Given a file, it allocates a file descriptor and inserts it into map of open files.
 	/// Returns file descriptor
 	fn add_file(&mut self, file: Box<dyn PosixFile>) -> u64 {
 		let fd = self.assign_new_fd();
