@@ -26,7 +26,6 @@ pub use self::tasks::*;
 pub use self::timer::*;
 
 mod condvar;
-pub mod fs;
 mod interfaces;
 #[cfg(feature = "newlib")]
 mod lwip;
@@ -38,6 +37,7 @@ mod spinlock;
 mod system;
 mod tasks;
 mod timer;
+pub mod vfs;
 
 #[cfg(feature = "newlib")]
 const LWIP_FD_BIT: i32 = 1 << 30;

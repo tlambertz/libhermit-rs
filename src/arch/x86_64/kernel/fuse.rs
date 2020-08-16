@@ -11,7 +11,7 @@
 
 use super::fuse_dax::{CacheEntry, DaxAllocator, FuseDaxCache, FUSE_DAX_MEM_RANGE_SZ};
 use super::fuse_h::*;
-use crate::syscalls::fs::{self, FileError, FilePerms, PosixFile, PosixFileSystem, SeekWhence};
+use crate::syscalls::vfs::{FileError, FilePerms, PosixFile, PosixFileSystem, SeekWhence, Stat};
 use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
@@ -177,10 +177,10 @@ impl<T: FuseInterface + 'static> PosixFileSystem for Fuse<T> {
 		Ok(())
 	}
 
-	fn stat(&self, filename: &str) -> Result<fs::Stat, FileError> {
+	fn stat(&self, filename: &str) -> Result<Stat, FileError> {
 		let feo = self.lookup(filename)?;
 
-		Ok(fs::Stat {
+		Ok(Stat {
 			ino: feo.attr.ino,
 			size: feo.attr.size,
 			blocks: feo.attr.blocks,
