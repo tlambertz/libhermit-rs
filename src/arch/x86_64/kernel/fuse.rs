@@ -514,9 +514,10 @@ impl<T: FuseInterface> FuseFile<T> {
 					len: FUSE_DAX_MEM_RANGE_SZ,
 				})
 			});
-			if mappings.is_empty() {
-				return;
-			}
+		}
+		
+		if mappings.is_empty() {
+			return;
 		}
 
 		trace!("Removing dax mappings {:?}", mappings);
