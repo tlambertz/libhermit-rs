@@ -393,7 +393,7 @@ pub trait SyscallInterface: Send + Sync {
 	}
 
 	#[cfg(not(feature = "newlib"))]
-	fn stat(&self, _file: *const u8, _st: usize) -> isize {
+	fn stat(&self, _file: *const u8, _st: usize) -> i32 {
 		info!("stat is unimplemented");
 		-ENOSYS
 	}
