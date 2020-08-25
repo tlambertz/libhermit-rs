@@ -30,6 +30,7 @@
 #![feature(lang_items)]
 #![feature(linkage)]
 #![feature(llvm_asm)]
+#![feature(asm)]
 #![feature(panic_info_message)]
 #![feature(specialization)]
 #![feature(naked_functions)]

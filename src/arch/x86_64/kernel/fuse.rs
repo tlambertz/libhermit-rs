@@ -9,6 +9,7 @@
 // - Parse errors from fuse-header and turn them into appropriate FileErrors
 // - implement more functions
 
+use crate::arch::x86_64::util::memcpy_noprefetch;
 use super::fuse_dax::{CacheEntry, DaxAllocator, FuseDaxCache, FUSE_DAX_MEM_RANGE_SZ};
 use super::fuse_h::*;
 use crate::syscalls::vfs::{Stat, FileError, FilePerms, PosixFile, PosixFileSystem, SeekWhence};
@@ -350,13 +351,16 @@ impl<T: FuseInterface> FuseFile<T> {
 		// Copy buffer into output.
 		let read_bytes = len;
 		trace!("Starting dax copy. {:p}, {:#x}, {:p}, {:#x}", buf.as_ptr(), buf.len(), cached.as_ptr(), cached.len());
-		buf[..read_bytes].copy_from_slice(&cached[..len]);
+
+		// Use non-prefetching memcpy implementation
+		//buf[..read_bytes].copy_from_slice(&cached[..len]);
+		unsafe{ memcpy_noprefetch(buf.as_mut_ptr(), cached.as_ptr(), len); }
 
 		trace!("read_dax output: {:?} ....", &buf[..core::cmp::min(16, buf.len())]);
-		Ok(read_bytes as u64)
+		Ok(read_bytes)
 	}
 
-	fn write_fuse(&mut self, buf: &[u8]) -> Result<u64, FileError> {
+	fn write_fuse(&mut self, buf: &[u8]) -> Result<usize, FileError> {
 		let mut len = buf.len();
 		if len > self.connection_options.max_bufsize {
 			debug!(
@@ -421,7 +425,10 @@ impl<T: FuseInterface> FuseFile<T> {
 
 		// Write buffer into cache.
 		trace!("copying data to slice! from {:p} to {:p} of len {:x}",  buf.as_ptr(), cached.as_ptr(), len);
-		cached[..len].copy_from_slice(buf);
+		
+		// Use non-prefetching memcpy implementation
+		//cached[..len].copy_from_slice(buf);
+		unsafe{ memcpy_noprefetch(cached.as_mut_ptr(), buf.as_ptr(), len); }
 
 		Ok(len)
 	}
