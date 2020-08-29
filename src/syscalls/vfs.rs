@@ -10,7 +10,8 @@ use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
-use core::ops::Deref;
+use alloc::sync::Arc;
+use crate::synch::std_mutex::Mutex;
 
 /*
 Design:
@@ -46,34 +47,38 @@ Open Questions:
 	- [HYPERVISOR BORDER] (via virtio)
 	- virtiofsd receives fuse command and sends reply
 
-TODO:
-- FileDescriptor newtype
 */
 
 // TODO: lazy static could be replaced with explicit init on OS boot.
-pub static FILESYSTEM: Spinlock<VirtualFilesystem> = Spinlock::new(VirtualFilesystem::new());
+pub static FILESYSTEM: VirtualFilesystem = VirtualFilesystem::new();
 
 pub struct VirtualFilesystem {
 	// Keep track of mount-points
-	mounts: BTreeMap<String, Box<dyn PosixFileSystem>>,
+	mounts: Spinlock<BTreeMap<String, Box<dyn PosixFileSystem>>>,
 
 	// Keep track of open files
-	files: BTreeMap<u64, Box<dyn PosixFile>>,
+	files: Spinlock<FileMap>,
 }
 
-impl VirtualFilesystem {
+type LockableFile = Arc<Mutex<Box<dyn PosixFile>>>;
+type FileDescriptor = u64;
+struct FileMap {
+	files: BTreeMap<FileDescriptor, LockableFile>
+}
+
+impl FileMap {
 	pub const fn new() -> Self {
 		Self {
-			mounts: BTreeMap::new(),
-			files: BTreeMap::new(),
+			files: BTreeMap::new()
 		}
 	}
+	
 
 	/// Returns next free file-descriptor. We map index in files BTreeMap as fd's.
 	/// Done determining the current biggest stored index.
 	/// This is efficient, since BTreeMap's iter() calculates min and max key directly.
 	/// see https://github.com/rust-lang/rust/issues/62924
-	fn assign_new_fd(&self) -> u64 {
+	fn assign_new_fd(&self) -> FileDescriptor {
 		// BTreeMap has efficient max/min index calculation. One way to access these is the following iter.
 		// Add 1 to get next never-assigned fd num
 		if let Some((fd, _)) = self.files.iter().next_back() {
@@ -85,74 +90,118 @@ impl VirtualFilesystem {
 
 	/// Given a file, it allocates a file descriptor and inserts it into map of open files.
 	/// Returns file descriptor
-	fn add_file(&mut self, file: Box<dyn PosixFile>) -> u64 {
+	pub fn add_file(&mut self, file: Box<dyn PosixFile>) -> FileDescriptor {
 		let fd = self.assign_new_fd();
-		self.files.insert(fd, file);
+		self.files.insert(fd, Arc::new(Mutex::new(file)));
 		fd
 	}
 
-	/// parses path `/MOUNTPOINT/internal-path` into mount-filesystem and internal_path
-	/// Returns (PosixFileSystem, internal_path) or Error on failure.
-	fn parse_path<'a, 'b>(
-		&'a self,
-		path: &'b str,
-	) -> Result<(&'a dyn PosixFileSystem, &'b str), FileError> {
-		// assert start with / (no pwd relative!), split path at /, look first element. Determine backing fs. If non existent, -ENOENT
-		if !path.starts_with('/') {
-			warn!("Relative paths not allowed!");
-			return Err(FileError::ENOENT);
-		}
-		let mut pathsplit = path.splitn(3, '/');
-		pathsplit.next(); // always empty, since first char is /
-		let mount = pathsplit.next().unwrap();
-		let internal_path = pathsplit.next().unwrap(); //TODO: this can fail from userspace, eg when passing "/test"
+	/// Returns a file. Cloned.
+	pub fn get_file(&mut self, fd: FileDescriptor) -> Option<LockableFile> {
+		self.files.get_mut(&fd).map(|x| x.clone())
+	}
 
-		if let Some(fs) = self.mounts.get(mount) {
-			Ok((fs.deref(), internal_path))
-		} else {
-			info!(
-				"Trying to open file on non-existing mount point '{}'!",
-				mount
-			);
-			Err(FileError::ENOENT)
+	/// Removes the file from the map, returning it if present
+	pub fn remove(&mut self, fd: FileDescriptor) -> Option<LockableFile> {
+		self.files.remove(&fd)
+	}
+}
+
+
+/// parses path `/MOUNTPOINT/internal-path` into mount-filesystem and internal_path
+/// Returns (MOUNTPOINT, internal_path) or Error on failure.
+fn parse_path(path: &str) -> Result<(&str, &str), FileError> {
+	// assert start with / (no pwd relative!), split path at /, look first element. Determine backing fs. If non existent, -ENOENT
+	if !path.starts_with('/') {
+		warn!("Relative paths not allowed!");
+		return Err(FileError::ENOENT);
+	}
+	let mut pathsplit = path.splitn(3, '/');
+	pathsplit.next(); // always empty, since first char is /
+	let mount = pathsplit.next().unwrap();
+	let internal_path = pathsplit.next().unwrap(); //TODO: this can fail from userspace, eg when passing "/test"
+
+	Ok((mount, internal_path))
+}
+
+impl VirtualFilesystem {
+	pub const fn new() -> Self {
+		Self {
+			mounts: Spinlock::new(BTreeMap::new()),
+			files: Spinlock::new(FileMap::new()),
 		}
 	}
 
 	/// Tries to open file at given path (/MOUNTPOINT/internal-path).
 	/// Looks up MOUNTPOINT in mounted dirs, passes internal-path to filesystem backend
 	/// Returns the file descriptor of the newly opened file, or an error on failure
-	pub fn open(&mut self, path: &str, perms: FilePerms) -> Result<u64, FileError> {
+	pub fn open(&self, path: &str, perms: FilePerms) -> Result<FileDescriptor, FileError> {
 		debug!("Opening file {} {:?}", path, perms);
-		let (fs, internal_path) = self.parse_path(path)?;
-		let file = fs.open(internal_path, perms)?;
-		Ok(self.add_file(file))
+		let (mountpoint, internal_path) = parse_path(path)?;
+		
+		if let Some(fs) = self.mounts.lock().get(mountpoint) {
+			let file = fs.open(internal_path, perms)?;
+			Ok(self.files.lock().add_file(file))
+		} else {
+			info!(
+				"Trying to open file on non-existing mount point '{}'!",
+				mountpoint
+			);
+			Err(FileError::ENOENT)
+		}
 	}
 
-	pub fn close(&mut self, fd: u64) {
+	pub fn close(&self, fd: FileDescriptor) {
 		debug!("Closing fd {}", fd);
-		if let Some(file) = self.files.get_mut(&fd) {
+		
+		// Remove file from map, so nobody else can access it anymore
+		// If it exists, close it
+		if let Some(file) = self.files.lock().remove(fd) {
+			// Lock the file, so we are only ones with access
+			let mut file = file.lock();
 			file.close().unwrap(); // TODO: handle error
+
+			// File is unlocked again, so other pending operations can happen (fail)
 		}
-		self.files.remove(&fd);
 	}
 
 	/// Unlinks a file given by path
-	pub fn unlink(&mut self, path: &str) -> Result<(), FileError> {
+	pub fn unlink(&self, path: &str) -> Result<(), FileError> {
 		debug!("Unlinking file {}", path);
-		let (fs, internal_path) = self.parse_path(path)?;
-		fs.unlink(internal_path)?;
-		Ok(())
+		let (mountpoint, internal_path) = parse_path(path)?;
+
+		// TODO: deduplicate this mount parsing/locking/error code with other functions
+		if let Some(fs) = self.mounts.lock().get(mountpoint) {
+			fs.unlink(internal_path)?;
+			Ok(())
+		} else {
+			info!(
+				"Trying to unlink file on non-existing mount point '{}'!",
+				mountpoint
+			);
+			Err(FileError::ENOENT)
+		}
 	}
 
 	/// Stats a file given by path
-	pub fn stat(&mut self, path: &str) -> Result<Stat, FileError> {
+	pub fn stat(&self, path: &str) -> Result<Stat, FileError> {
 		debug!("Stat file {}", path);
-		let (fs, internal_path) = self.parse_path(path)?;
-		Ok(fs.stat(internal_path)?)
+		let (mountpoint, internal_path) = parse_path(path)?;
+
+		// TODO: deduplicate this mount parsing/locking/error code with other functions
+		if let Some(fs) = self.mounts.lock().get(mountpoint) {
+			Ok(fs.stat(internal_path)?)
+		} else {
+			info!(
+				"Trying to unlink file on non-existing mount point '{}'!",
+				mountpoint
+			);
+			Err(FileError::ENOENT)
+		}
 	}
 
 	/// Create new backing-fs at mountpoint mntpath
-	pub fn mount(&mut self, mntpath: &str, mntobj: Box<dyn PosixFileSystem>) -> Result<(), ()> {
+	pub fn mount(&self, mntpath: &str, mntobj: Box<dyn PosixFileSystem>) -> Result<(), ()> {
 		info!("Mounting {}", mntpath);
 		if mntpath.contains('/') {
 			warn!(
@@ -163,19 +212,68 @@ impl VirtualFilesystem {
 		}
 
 		// if mounts contains path already abort
-		if self.mounts.contains_key(mntpath) {
+		if self.mounts.lock().contains_key(mntpath) {
 			warn!("Mountpoint already exists!");
 			return Err(());
 		}
 
 		// insert filesystem into mounts, done
-		self.mounts.insert(mntpath.to_owned(), mntobj);
+		self.mounts.lock().insert(mntpath.to_owned(), mntobj);
 		Ok(())
 	}
 
+	pub fn read(&self, fd: FileDescriptor, buf: &mut [u8]) -> Result<usize, FileError>{
+		if let Some(file) = self.files.lock().get_file(fd) {
+			// Get exclusive access to file and write
+			file.lock().read(buf)
+		} else {
+			// File does not exist!
+			Err(FileError::ENOENT)
+		}
+	}
+
+	pub fn write(&self, fd: FileDescriptor, buf: &[u8]) -> Result<usize, FileError>{
+		if let Some(file) = self.files.lock().get_file(fd) {
+			// Get exclusive access to file and write
+			file.lock().write(buf)
+		} else {
+			// File does not exist!
+			Err(FileError::ENOENT)
+		}
+	}
+
+	pub fn lseek(&self, fd: FileDescriptor, offset: isize, whence: SeekWhence) -> Result<usize, FileError>{
+		if let Some(file) = self.files.lock().get_file(fd) {
+			// Get exclusive access to file and write
+			file.lock().lseek(offset, whence)
+		} else {
+			// File does not exist!
+			Err(FileError::ENOENT)
+		}
+	}
+
+	pub fn fsync(&self, fd: FileDescriptor) -> Result<(), FileError>{
+		if let Some(file) = self.files.lock().get_file(fd) {
+			// Get exclusive access to file and write
+			file.lock().fsync()
+		} else {
+			// File does not exist!
+			Err(FileError::ENOENT)
+		}
+	}
+
 	/// Run closure on file referenced by file descriptor.
-	pub fn fd_op(&mut self, fd: u64, f: impl FnOnce(Option<&mut Box<dyn PosixFile>>)) {
-		f(self.files.get_mut(&fd));
+	pub fn fd_op(&self, fd: FileDescriptor, f: impl FnOnce(Option<&mut Box<dyn PosixFile>>)) {
+		if let Some(file) = self.files.lock().get_file(fd) {
+			// Get exclusive access to file
+			let mut file = file.lock();
+
+			// Do operation
+			f(Some(&mut file));
+		} else {
+			// File does not exist!
+			f(None);
+		}
 	}
 }
 

@@ -311,10 +311,9 @@ pub fn create_virtiofs_driver(
 	// send FUSE_INIT to create session
 	fuse.send_init();
 
-	let mut fs = vfs::FILESYSTEM.lock();
 	let tag = util::c_buf_to_str(&device_cfg.tag);
 	info!("Mounting virtio-fs at /{}", tag);
-	fs.mount(tag, Box::new(fuse))
+	vfs::FILESYSTEM.mount(tag, Box::new(fuse))
 		.expect("Mount failed. Duplicate tag?");
 
 	Ok(drv)
