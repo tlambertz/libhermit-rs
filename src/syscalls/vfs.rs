@@ -154,7 +154,9 @@ impl VirtualFilesystem {
 
 		// Remove file from map, so nobody else can access it anymore
 		// If it exists, close it
-		if let Some(file) = self.files.lock().remove(fd) {
+
+		let file = self.files.lock().remove(fd);
+		if let Some(file) = file {
 			// Lock the file, so we are only ones with access
 			let mut file = file.lock();
 			file.close().unwrap(); // TODO: handle error
@@ -221,7 +223,8 @@ impl VirtualFilesystem {
 	}
 
 	pub fn read(&self, fd: FileDescriptor, buf: &mut [u8]) -> Result<usize, FileError> {
-		if let Some(file) = self.files.lock().get_file(fd) {
+		let file = self.files.lock().get_file(fd);
+		if let Some(file) = file {
 			// Get exclusive access to file and write
 			file.lock().read(buf)
 		} else {
@@ -231,7 +234,8 @@ impl VirtualFilesystem {
 	}
 
 	pub fn write(&self, fd: FileDescriptor, buf: &[u8]) -> Result<usize, FileError> {
-		if let Some(file) = self.files.lock().get_file(fd) {
+		let file = self.files.lock().get_file(fd);
+		if let Some(file) = file {
 			// Get exclusive access to file and write
 			file.lock().write(buf)
 		} else {
@@ -246,7 +250,8 @@ impl VirtualFilesystem {
 		offset: isize,
 		whence: SeekWhence,
 	) -> Result<usize, FileError> {
-		if let Some(file) = self.files.lock().get_file(fd) {
+		let file = self.files.lock().get_file(fd);
+		if let Some(file) = file {
 			// Get exclusive access to file and write
 			file.lock().lseek(offset, whence)
 		} else {
@@ -256,7 +261,8 @@ impl VirtualFilesystem {
 	}
 
 	pub fn fsync(&self, fd: FileDescriptor) -> Result<(), FileError> {
-		if let Some(file) = self.files.lock().get_file(fd) {
+		let file = self.files.lock().get_file(fd);
+		if let Some(file) = file {
 			// Get exclusive access to file and write
 			file.lock().fsync()
 		} else {
@@ -267,7 +273,8 @@ impl VirtualFilesystem {
 
 	/// Run closure on file referenced by file descriptor.
 	pub fn fd_op(&self, fd: FileDescriptor, f: impl FnOnce(Option<&mut Box<dyn PosixFile>>)) {
-		if let Some(file) = self.files.lock().get_file(fd) {
+		let file = self.files.lock().get_file(fd);
+		if let Some(file) = file {
 			// Get exclusive access to file
 			let mut file = file.lock();
 
