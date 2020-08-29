@@ -50,6 +50,8 @@
 #![cfg_attr(target_os = "hermit", cfg_attr(test, no_main))]
 // for memcpy() only
 #![feature(naked_functions)]
+// needed for mutexguard
+#![feature(negative_impls)]
 
 // EXTERNAL CRATES
 #[macro_use]
