@@ -240,7 +240,7 @@ pub trait SyscallInterface: Send + Sync {
 		let name = unsafe { util::c_str_to_str(name) };
 		debug!("unlink {}", name);
 
-		let res = vfs::FILESYSTEM.lock().unlink(&name);
+		let res = vfs::FILESYSTEM.unlink(&name);
 
 		match res {
 			Ok(()) => 0,
@@ -263,8 +263,7 @@ pub trait SyscallInterface: Send + Sync {
 		let name = unsafe { util::c_str_to_str(name) };
 		debug!("Open {}, {}, {}", name, flags, mode);
 
-		let mut fs = vfs::FILESYSTEM.lock();
-		let fd = fs.open(&name, open_flags_to_perm(flags, mode as u32));
+		let fd = vfs::FILESYSTEM.open(&name, open_flags_to_perm(flags, mode as u32));
 
 		if let Ok(fd) = fd {
 			fd as i32
@@ -279,8 +278,7 @@ pub trait SyscallInterface: Send + Sync {
 			return 0;
 		}
 
-		let mut fs = vfs::FILESYSTEM.lock();
-		fs.close(fd as u64);
+		vfs::FILESYSTEM.close(fd as u64);
 		0
 	}
 
@@ -297,13 +295,9 @@ pub trait SyscallInterface: Send + Sync {
 		// TODO: assert that buf is valid in userspace
 		let buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
 
-		let mut fs = vfs::FILESYSTEM.lock();
-		let mut read_bytes = Err(vfs::FileError::ENOSYS);
-		fs.fd_op(fd as u64, |file| {
-			read_bytes = file.unwrap().read(buf);
-		});
+		let ret = vfs::FILESYSTEM.read(fd as u64, buf);
 
-		convert_fs_result(read_bytes)
+		convert_fs_result(ret)
 	}
 
 	fn write(&self, fd: i32, buf: *const u8, len: usize) -> isize {
@@ -313,13 +307,9 @@ pub trait SyscallInterface: Send + Sync {
 			// Normal file
 			let buf = unsafe { slice::from_raw_parts(buf, len) };
 
-			let mut written_bytes = Err(vfs::FileError::ENOSYS);
-			let mut fs = vfs::FILESYSTEM.lock();
-			fs.fd_op(fd as u64, |file| {
-				written_bytes = file.unwrap().write(buf);
-			});
-			debug!("Write done! {:?}", written_bytes);
-			convert_fs_result(written_bytes)
+			let ret = vfs::FILESYSTEM.write(fd as u64, buf);
+			debug!("Write done! {:?}", ret);
+			convert_fs_result(ret)
 		} else {
 			// stdin/err/out all go to console
 			unsafe {
@@ -337,11 +327,8 @@ pub trait SyscallInterface: Send + Sync {
 	fn lseek(&self, fd: i32, offset: isize, whence: i32) -> isize {
 		debug!("lseek! {}, {}, {}", fd, offset, whence);
 
-		let mut fs = vfs::FILESYSTEM.lock();
-		let mut ret = Err(vfs::FileError::ENOSYS);
-		fs.fd_op(fd as u64, |file| {
-			ret = file.unwrap().lseek(offset, whence.try_into().unwrap());
-		});
+		let whence = whence.try_into().unwrap();
+		let ret = vfs::FILESYSTEM.lseek(fd as u64, offset, whence);
 
 		convert_fs_result(ret)
 	}
@@ -353,8 +340,7 @@ pub trait SyscallInterface: Send + Sync {
 
 		trace!("stat {}", filename);
 
-		let mut fs = vfs::FILESYSTEM.lock();
-		let stat = fs.stat(&filename);
+		let stat = vfs::FILESYSTEM.stat(&filename);
 
 		trace!("fuse: {:?}", stat);
 		if let Ok(stat) = stat {
@@ -393,13 +379,7 @@ pub trait SyscallInterface: Send + Sync {
 	fn fsync(&self, fd: i32) -> i32 {
 		debug!("fsync! {}", fd);
 
-		let mut fs = vfs::FILESYSTEM.lock();
-		let mut ret = Err(vfs::FileError::ENOSYS);
-		fs.fd_op(fd as u64, |file| {
-			ret = file.unwrap().fsync();
-		});
-
-		match ret {
+		match vfs::FILESYSTEM.fsync(fd as u64) {
 			Ok(()) => 0,
 			Err(e) => convert_fs_error(e),
 		}
