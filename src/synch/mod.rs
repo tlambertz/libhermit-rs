@@ -11,3 +11,4 @@
 pub mod recmutex;
 pub mod semaphore;
 pub mod spinlock;
+pub mod std_mutex;
