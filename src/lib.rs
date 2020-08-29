@@ -39,6 +39,9 @@
 #![allow(unused_macros)]
 #![no_std]
 
+// needed for mutexguard
+#![feature(negative_impls)]
+
 // EXTERNAL CRATES
 #[macro_use]
 extern crate alloc;
