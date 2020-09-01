@@ -12,11 +12,11 @@
 use super::fuse_dax::{CacheEntry, DaxAllocator, FuseDaxCache, FUSE_DAX_MEM_RANGE_SZ};
 use super::fuse_h::*;
 use crate::arch::x86_64::util::memcpy_noprefetch;
+use crate::synch::std_mutex::Mutex;
 use crate::syscalls::vfs::{FileError, FilePerms, PosixFile, PosixFileSystem, SeekWhence, Stat};
 use alloc::boxed::Box;
-use alloc::rc::Rc;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::cell::RefCell;
 use core::{u32, u8};
 
 // response out layout eg @ https://github.com/zargony/fuse-rs/blob/bf6d1cf03f3277e35b580f3c7b9999255d72ecf3/src/ll/request.rs#L44
@@ -27,7 +27,7 @@ const FUSE_ENOENT_ID: u64 = 0;
 const FUSE_ROOT_ID: u64 = 1;
 const MAX_BUFFER_SIZE: usize = 0x1000 * 256;
 
-pub trait FuseInterface {
+pub trait FuseInterface: Send {
 	fn send_recv_buffers_blocking(
 		&mut self,
 		to_host: &[&[u8]],
@@ -37,7 +37,7 @@ pub trait FuseInterface {
 
 /// Driver which can easily be copied into a FuseFile
 /// Abstracts sending of a command over FuseInterface's byte arrays send/recv.
-struct FuseDriver<T: FuseInterface>(Rc<RefCell<T>>);
+struct FuseDriver<T: FuseInterface>(Arc<Mutex<T>>);
 
 impl<T: FuseInterface> FuseDriver<T> {
 	/// Send a command via the fuse driver and get the response.
@@ -57,7 +57,7 @@ impl<T: FuseInterface> FuseDriver<T> {
 
 		// Send the buffers
 		self.0
-			.borrow_mut()
+			.lock()
 			.send_recv_buffers_blocking(&to_host, &from_host)
 			.map_err(|_| FileError::EIO)?;
 
@@ -81,7 +81,7 @@ impl<T: FuseInterface> FuseDriver<T> {
 
 		// Send the buffers
 		self.0
-			.borrow_mut()
+			.lock()
 			.send_recv_buffers_blocking(&to_host, &[])
 			.map_err(|_| FileError::EIO)
 	}
@@ -95,8 +95,8 @@ impl<T: FuseInterface> FuseDriver<T> {
 
 pub struct Fuse<T: FuseInterface> {
 	driver: FuseDriver<T>,
-	dax_allocator: Option<Rc<RefCell<DaxAllocator>>>,
-	options: Option<Rc<FuseConnectionOptions>>,
+	dax_allocator: Option<Arc<Mutex<DaxAllocator>>>,
+	options: Option<Arc<FuseConnectionOptions>>,
 }
 
 struct FuseConnectionOptions {
@@ -203,7 +203,7 @@ impl<T: FuseInterface + 'static> PosixFileSystem for Fuse<T> {
 }
 
 impl<T: FuseInterface + 'static> Fuse<T> {
-	pub fn new(driver: Rc<RefCell<T>>) -> Self {
+	pub fn new(driver: Arc<Mutex<T>>) -> Self {
 		Self {
 			driver: FuseDriver(driver),
 			dax_allocator: None,
@@ -211,10 +211,10 @@ impl<T: FuseInterface + 'static> Fuse<T> {
 		}
 	}
 
-	pub fn new_with_dax(driver: Rc<RefCell<T>>, dax_allocator: DaxAllocator) -> Self {
+	pub fn new_with_dax(driver: Arc<Mutex<T>>, dax_allocator: DaxAllocator) -> Self {
 		Self {
 			driver: FuseDriver(driver),
-			dax_allocator: Some(Rc::new(RefCell::new(dax_allocator))),
+			dax_allocator: Some(Arc::new(Mutex::new(dax_allocator))),
 			options: None,
 		}
 	}
@@ -231,7 +231,7 @@ impl<T: FuseInterface + 'static> Fuse<T> {
 			0
 		};
 
-		self.options = Some(Rc::new(FuseConnectionOptions {
+		self.options = Some(Arc::new(FuseConnectionOptions {
 			max_bufsize: bufsize as usize,
 		}));
 	}
@@ -306,7 +306,7 @@ struct FuseFile<T: FuseInterface> {
 	dax_cache: Option<FuseDaxCache>,
 	attr: fuse_attr,
 	open_options: FilePerms,
-	connection_options: Rc<FuseConnectionOptions>,
+	connection_options: Arc<FuseConnectionOptions>,
 }
 
 impl<T: FuseInterface> FuseFile<T> {

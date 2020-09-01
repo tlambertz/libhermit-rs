@@ -1,13 +1,15 @@
+use crate::synch::std_mutex::Mutex;
 use alloc::collections::BTreeMap;
-use alloc::rc::Rc;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::cell::RefCell;
 
 pub static FUSE_DAX_MEM_RANGE_SZ: u64 = 512 * 4096; // 512 pages == 2MiB, same as linux kernel
 
+// TODO: are the Arc and Mutexes on the Slab's really necessary? There might be an easy way to remove them.
+
 /// Very simple slab allocator for fuse dax cache
 pub struct DaxAllocator {
-	free_stack: Vec<Rc<RefCell<Slab>>>,
+	free_stack: Vec<Arc<Mutex<Slab>>>,
 }
 
 impl DaxAllocator {
@@ -17,7 +19,7 @@ impl DaxAllocator {
 		let ptr = start as *mut u8;
 		let free_stack = (0..count)
 			.map(|i| {
-				Rc::new(RefCell::new(Slab {
+				Arc::new(Mutex::new(Slab {
 					addr: unsafe { ptr.add((i * FUSE_DAX_MEM_RANGE_SZ) as usize) },
 					moffset: i * FUSE_DAX_MEM_RANGE_SZ,
 				}))
@@ -26,11 +28,11 @@ impl DaxAllocator {
 		Self { free_stack }
 	}
 
-	fn allocate(&mut self) -> Result<Rc<RefCell<Slab>>, ()> {
+	fn allocate(&mut self) -> Result<Arc<Mutex<Slab>>, ()> {
 		self.free_stack.pop().ok_or(())
 	}
 
-	fn free(&mut self, buf: Rc<RefCell<Slab>>) {
+	fn free(&mut self, buf: Arc<Mutex<Slab>>) {
 		self.free_stack.push(buf);
 	}
 }
@@ -44,32 +46,32 @@ struct Slab {
 /// Single cache entry for fuse dax cache. Has a memory region (slab) and offset into file
 #[derive(Debug, Clone)]
 pub struct CacheEntry {
-	slab: Rc<RefCell<Slab>>,
+	slab: Arc<Mutex<Slab>>,
 	file_offset: usize,
 }
 
 impl CacheEntry {
 	pub fn as_buf(&mut self, file_offset: usize) -> &mut [u8] {
 		let buf = unsafe {
-			core::slice::from_raw_parts_mut(self.slab.borrow().addr, FUSE_DAX_MEM_RANGE_SZ as usize)
+			core::slice::from_raw_parts_mut(self.slab.lock().addr, FUSE_DAX_MEM_RANGE_SZ as usize)
 		};
 		&mut buf[(file_offset - self.file_offset)..]
 	}
 
 	pub fn get_moffset(&self) -> u64 {
 		//info!("{:x}", self.slab.borrow().moffset);
-		self.slab.borrow().moffset
+		self.slab.lock().moffset
 	}
 }
 
 /// Cache for a single file. Stores fileoffset <-> allocated cache mappings
 pub struct FuseDaxCache {
 	entries: BTreeMap<u64, CacheEntry>,
-	allocator: Rc<RefCell<DaxAllocator>>,
+	allocator: Arc<Mutex<DaxAllocator>>,
 }
 
 impl FuseDaxCache {
-	pub fn new(allocator: Rc<RefCell<DaxAllocator>>) -> Self {
+	pub fn new(allocator: Arc<Mutex<DaxAllocator>>) -> Self {
 		Self {
 			entries: BTreeMap::new(),
 			allocator,
@@ -92,13 +94,13 @@ impl FuseDaxCache {
 		}*/
 		let file_offset = align_down!(file_offset as u64, FUSE_DAX_MEM_RANGE_SZ);
 
-		let slab = self.allocator.borrow_mut().allocate()?;
+		let slab = self.allocator.lock().allocate()?;
 		{
 			trace!(
 				"Alloc'd slab for offset {} at {:p} [{:x}]",
 				file_offset,
-				slab.borrow().addr,
-				slab.borrow().moffset
+				slab.lock().addr,
+				slab.lock().moffset
 			);
 		}
 		let entry = CacheEntry {
@@ -122,9 +124,15 @@ impl FuseDaxCache {
 		let mut entries = BTreeMap::new();
 		core::mem::swap(&mut entries, &mut self.entries);
 
-		let mut alloc = self.allocator.borrow_mut();
+		let mut alloc = self.allocator.lock();
 		for (_addr, buf) in entries.into_iter() {
 			alloc.free(buf.slab);
 		}
 	}
 }
+
+// TODO: This is likely wrong, just a fix to make it compile currently.
+unsafe impl Send for FuseDaxCache {}
+unsafe impl Sync for FuseDaxCache {}
+unsafe impl Send for DaxAllocator {}
+unsafe impl Sync for DaxAllocator {}
