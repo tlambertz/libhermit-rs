@@ -17,14 +17,17 @@ use crate::arch::x86_64::kernel::virtio_net;
 use crate::arch::x86_64::mm::paging;
 use crate::config::VIRTIO_MAX_QUEUE_SIZE;
 
+use crate::synch::semaphore::Semaphore;
 use crate::synch::std_mutex::Mutex;
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::convert::TryInto;
 use core::sync::atomic::spin_loop_hint;
+use core::sync::atomic::AtomicU16;
 use core::sync::atomic::{fence, Ordering};
 
 use self::consts::*;
@@ -70,10 +73,11 @@ pub struct Virtq<'a> {
 	virtq_desc: VirtqDescriptors,
 	// A ring of available descriptor heads with free-running index
 	avail: Arc<Mutex<VirtqAvail<'a>>>,
-	// A ring of used descriptor heads with free-running index
-	used: Arc<Mutex<VirtqUsed<'a>>>,
+	// A ring of used descriptor heads with free-running index.
+	// READ ONLY, so does not need to be protected by a Mutex
+	used: VirtqUsed<'a>,
 	// Address where queue index is written to on notify
-	queue_notify_address: &'a mut u16,
+	queue_notify_address: Mutex<&'a mut u16>,
 }
 
 // TODO: is this SEND correct?. Needed because of Rc's in descriptors...
@@ -94,8 +98,8 @@ impl<'a> Virtq<'a> {
 			vqsize,
 			virtq_desc: VirtqDescriptors::new(virtq_desc),
 			avail: Arc::new(Mutex::new(avail)),
-			used: Arc::new(Mutex::new(used)),
-			queue_notify_address,
+			used,
+			queue_notify_address: Mutex::new(queue_notify_address),
 		}
 	}
 
@@ -192,7 +196,8 @@ impl<'a> Virtq<'a> {
 			idx: used_idx,
 			ring: unsafe { core::slice::from_raw_parts(used_mem.as_ptr() as *const _, vqsize) },
 			//rawmem: used_mem_box,
-			last_idx: 0,
+			next_to_be_processed_idx: AtomicU16::new(0),
+			waiting: Mutex::new(BTreeMap::new()),
 		};
 		let vq = Virtq::new(
 			index,
@@ -206,7 +211,7 @@ impl<'a> Virtq<'a> {
 		Some(vq)
 	}
 
-	fn notify_device(&mut self) {
+	fn notify_device(&self) {
 		// 4.1.4.4.1 Device Requirements: Notification capability
 		// virtio-fs does NOT offer VIRTIO_F_NOTIFICATION_DATA
 
@@ -214,7 +219,7 @@ impl<'a> Virtq<'a> {
 		// When VIRTIO_F_NOTIFICATION_DATA has not been negotiated, the driver sends an available buffer notification
 		// to the device by writing the 16-bit virtqueue index of this virtqueue to the Queue Notify address.
 		trace!("Notifying device of updated virtqueue ({})...!", self.index);
-		*self.queue_notify_address = self.index;
+		**(self.queue_notify_address.lock()) = self.index;
 	}
 
 	// Places dat in virtq, waits until buffer is used and response is in rsp_buf.
@@ -261,10 +266,8 @@ impl<'a> Virtq<'a> {
 		// - After the driver writes a descriptor index into the available ring:
 		//     If flags is 1, the driver SHOULD NOT send a notification.
 		//     If flags is 0, the driver MUST send a notification.
-		let vqused = self.used.lock();
-		let should_notify = *vqused.flags == 0;
+		let should_notify = *self.used.flags == 0;
 		drop(vqavail);
-		drop(vqused);
 
 		if should_notify {
 			self.notify_device();
@@ -273,8 +276,11 @@ impl<'a> Virtq<'a> {
 		Ok(())
 	}
 
-	// Places dat in virtq, waits until buffer is used and response is in rsp_buf.
-	pub fn send_blocking(&mut self, dat: &[&[u8]], rsp_buf: Option<&[&mut [u8]]>) {
+	///
+	/// Places dat in virtq, waits until buffer is used and response is in rsp_buf.
+	/// Uses interior mutability.
+	/// Dont swap polling on/off!
+	pub fn send_blocking(&self, dat: &[&[u8]], rsp_buf: Option<&[&mut [u8]]>, polling: bool) {
 		// 2.6.13 Supplying Buffers to The Device
 		// The driver offers buffers to one of the device’s virtqueues as follows:
 
@@ -351,18 +357,15 @@ impl<'a> Virtq<'a> {
 		// - After the driver writes a descriptor index into the available ring:
 		//     If flags is 1, the driver SHOULD NOT send a notification.
 		//     If flags is 0, the driver MUST send a notification.
-		let vqused = self.used.lock();
-		let should_notify = *vqused.flags == 0;
+		let should_notify = *self.used.flags == 0;
 		drop(vqavail);
-		drop(vqused);
 
 		if should_notify {
 			self.notify_device();
 		}
 
 		// wait until done (placed in used buffer)
-		let mut vqused = self.used.lock();
-		vqused.wait_until_done(&chain);
+		self.used.wait_until_chain_used(&chain, polling);
 
 		// give chain back, so we can reuse the descriptors!
 		drop(chain);
@@ -370,8 +373,8 @@ impl<'a> Virtq<'a> {
 	}
 
 	pub fn check_used_elements(&mut self) -> Option<u32> {
-		let mut vqused = self.used.lock();
-		vqused.check_elements()
+		/*self.used.check_elements()*/
+		None
 	}
 
 	pub fn add_buffer(&mut self, index: usize, addr: u64, len: usize, flags: u16) {
@@ -404,20 +407,20 @@ impl<'a> Virtq<'a> {
 	}
 
 	pub fn has_packet(&self) -> bool {
-		let vqused = self.used.lock();
-
-		vqused.last_idx != *vqused.idx
+		/*self.used.last_idx != *self.used.idx*/
+		false
 	}
 
 	pub fn get_available_buffer(&self) -> Result<u32, ()> {
-		let vqavail = self.avail.lock();
+		/*let vqavail = self.avail.lock();
 		let index = *vqavail.idx % self.vqsize;
 
-		Ok(index as u32)
+		Ok(index as u32)*/
+		Err(())
 	}
 
 	pub fn get_used_buffer(&self) -> Result<(u32, u32), ()> {
-		let vqused = self.used.lock();
+		/*let vqused = &self.used;
 
 		if vqused.last_idx != *vqused.idx {
 			let used_index = vqused.last_idx as usize;
@@ -426,11 +429,16 @@ impl<'a> Virtq<'a> {
 			Ok((usedelem.id, usedelem.len))
 		} else {
 			Err(())
-		}
+		}*/
+		Err(())
 	}
 
 	pub fn buffer_consumed(&mut self) {
-		let mut vqused = self.used.lock();
+		// TODO: VirtioNET is broken with this change.
+		// If I read this correctly, it should check if a buffer has been placed into used queue
+		// If it has, place it in available again?
+		/*
+		let mut vqused = &self.used;
 
 		if vqused.last_idx != *vqused.idx {
 			let usedelem = vqused.ring[vqused.last_idx as usize % vqused.ring.len()];
@@ -454,7 +462,7 @@ impl<'a> Virtq<'a> {
 			if should_notify {
 				self.notify_device();
 			}
-		}
+		}*/
 	}
 }
 
@@ -517,9 +525,10 @@ struct VirtqDescriptors {
 	used_chains: RefCell<Vec<Rc<RefCell<VirtqDescriptorChain>>>>,
 }
 
-// TODO: this SEND is incorrect!. but temporarily needed to make virtq compile as Send
+// TODO: this SEND/SYNC is incorrect!. but temporarily needed to make virtq compile as Send
 // Send -> Save to use with different threads at different times.
 unsafe impl Send for VirtqDescriptors {}
+unsafe impl Sync for VirtqDescriptors {}
 impl VirtqDescriptors {
 	fn new(descr_raw: Vec<Box<virtq_desc_raw>>) -> Self {
 		VirtqDescriptors {
@@ -617,40 +626,127 @@ struct VirtqUsed<'a> {
 	flags: &'a u16,
 	idx: &'a u16,
 	ring: &'a [virtq_used_elem],
-	//rawmem: Box<[u16]>,
-	last_idx: u16,
+
+	// Last index that has activly been processed
+	next_to_be_processed_idx: AtomicU16,
+
+	// Map of semaphores, which block threads that are waiting for the associated descriptor id.
+	waiting: Mutex<BTreeMap<u16, Arc<Semaphore>>>,
 }
 
 impl<'a> VirtqUsed<'a> {
-	fn check_elements(&mut self) -> Option<u32> {
-		if unsafe { core::ptr::read_volatile(self.idx) } == self.last_idx {
+	/*fn check_elements(&mut self) -> Option<u32> {
+		let last_idx = self.last_idx.lock();
+		if unsafe { core::ptr::read_volatile(self.idx) } == last_idx {
 			None
 		} else {
 			let usedelem = self.ring[(self.last_idx as usize) % self.ring.len()];
-			self.last_idx = self.last_idx.wrapping_add(1);
+			last_idx = last_idx.wrapping_add(1);
 
 			fence(Ordering::SeqCst);
 
 			Some(usedelem.id)
 		}
-	}
+	}*/
 
-	fn wait_until_done(&mut self, chain: &VirtqDescriptorChain) -> bool {
-		// TODO: this might break if we have multiple running transfers at a time?
-		while unsafe { core::ptr::read_volatile(self.idx) } == self.last_idx {
-			spin_loop_hint();
+	/// Waits until a descriptor chain is done.
+	/// Returns only once it has been placed in the used-buffer by the device.
+	///
+	/// EVERY chain HAS to be checked EXACTLY ONCE for completion, else this implementation breaks!
+	///
+	/// TODO: ensure there is only one polling thread at a time? It currently works, but that might be more efficient
+	fn wait_until_chain_used(&self, chain: &VirtqDescriptorChain, polling: bool) {
+		// This is the target index we are waiting to appear in the used buffer
+		let target_idx = chain.0.first().unwrap().index as u32;
+		let next_idx = self.next_to_be_processed_idx.load(Ordering::Relaxed);
+
+		// If we are polling
+		while polling {
+			// Poll until we see a change in the buffers index
+			while unsafe { core::ptr::read_volatile(self.idx) } == next_idx {
+				spin_loop_hint();
+			}
+			// See which descriptor-index the new used descriptor has
+			trace!("Seen new descriptor at index {}!", next_idx);
+			let usedelem = self.ring[next_idx as usize % self.ring.len()];
+			let new_desc_idx = usedelem.id;
+			trace!("New desc is of id {}", new_desc_idx);
+
+			// Update next index
+			let next_idx = next_idx.wrapping_add(1);
+
+			// Now there have two options
+			if new_desc_idx == target_idx {
+				trace!("Correct descriptor!");
+				// A) The buffer is the one we want to see.
+				//    Consume the buffer by increasing the last processed index
+				let oldval = self
+					.next_to_be_processed_idx
+					.swap(next_idx, Ordering::Relaxed);
+
+				// Assert that nothing has gone terribly wrong. We should still have the old next_to_be_processed_idx.
+				assert!(oldval.wrapping_add(1) == next_idx);
+
+				// Return, to exit polling
+				return;
+			} else {
+				trace!("Wrong descriptor, expecting {}!", target_idx);
+				// B) This is the wrong buffer! This means someone else is likely processing this one.
+				//    If nobody else is, we enter an endless loop!
+				debug!("See wrong buffer! Waiting for next element to be ready! This might be an endless loop, if no other consumer checks for completion!");
+
+				// Wake threads which were waiting on the current id to become available if there are any
+				if let Some(semaphore) = self.waiting.lock().remove(&(target_idx as u16)) {
+					semaphore.release();
+				}
+
+				// Wait until something else handles the buffer which we are not. This is suboptimal, because it forces in-order processing of events
+				// In practice, this should not make a difference, since users (hopefully) always register a completion listener for their buffers
+				// TODO: is this really slow because of atomics?
+				while self.next_to_be_processed_idx.load(Ordering::Relaxed) != next_idx {
+					info!("Rescheduling, since not buffer not available yet!");
+					core_scheduler().scheduler();
+				}
+
+				// Alternative: Update our own next_idx, so we poll for the next element to become ready.
+				// But then we would have to keep a list of "ahead of time" processed elements.
+
+				// Someone else has handeled the buffer, fall-through and try again on the next buffer.
+			}
 		}
-		self.last_idx = *self.idx;
 
-		let usedelem = self.ring[(self.last_idx.wrapping_sub(1) as usize) % self.ring.len()];
+		// We are NOT polling, so we reschedule until an interrupt wakes us again.
+		let semaphore = Arc::new(Semaphore::new(1));
+		// Aquire semaphore once ourselves. This one will be released by the interrupt.
+		semaphore.acquire(None);
 
-		fence(Ordering::SeqCst);
+		// Place semaphore into waiting map.
+		self.waiting
+			.lock()
+			.insert(target_idx as u16, semaphore.clone());
 
-		assert_eq!(usedelem.id, chain.0.first().unwrap().index as u32);
-		true
+		// Aquire semaphore again, so we are paused until the interrupt
+		semaphore.acquire(None);
 
-		// current version cannot fail.
-		//false
+		// When we get here, the interrupt has woken us
+		trace!("Woken from interrupt");
+
+		// since we force in-order processing, the next item after last_processed should be ours
+		let next_idx = self
+			.next_to_be_processed_idx
+			.load(Ordering::SeqCst)
+			.wrapping_add(1);
+		let usedelem = self.ring[next_idx as usize % self.ring.len()];
+		let new_desc_idx = usedelem.id;
+
+		// Assert that nothing has gone terribly wrong
+		assert!(new_desc_idx == target_idx);
+
+		// Acknowlege that we have processed the buffer by increasing last_processed by one
+		let oldval = self
+			.next_to_be_processed_idx
+			.swap(next_idx, Ordering::SeqCst);
+		assert!(oldval.wrapping_add(1) == next_idx);
 	}
 }
 

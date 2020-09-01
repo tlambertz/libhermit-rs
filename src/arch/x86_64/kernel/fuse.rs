@@ -26,12 +26,14 @@ use core::{u32, u8};
 const FUSE_ENOENT_ID: u64 = 0;
 const FUSE_ROOT_ID: u64 = 1;
 const MAX_BUFFER_SIZE: usize = 0x1000 * 256;
+const USE_POLLING: bool = true;
 
 pub trait FuseInterface: Send {
 	fn send_recv_buffers_blocking(
 		&mut self,
 		to_host: &[&[u8]],
 		from_host: &[&mut [u8]],
+		polling: bool,
 	) -> Result<(), ()>;
 }
 
@@ -58,7 +60,7 @@ impl<T: FuseInterface> FuseDriver<T> {
 		// Send the buffers
 		self.0
 			.lock()
-			.send_recv_buffers_blocking(&to_host, &from_host)
+			.send_recv_buffers_blocking(&to_host, &from_host, USE_POLLING)
 			.map_err(|_| FileError::EIO)?;
 
 		// Got reply, return
@@ -82,7 +84,7 @@ impl<T: FuseInterface> FuseDriver<T> {
 		// Send the buffers
 		self.0
 			.lock()
-			.send_recv_buffers_blocking(&to_host, &[])
+			.send_recv_buffers_blocking(&to_host, &[], USE_POLLING)
 			.map_err(|_| FileError::EIO)
 	}
 
