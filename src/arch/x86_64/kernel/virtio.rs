@@ -17,8 +17,10 @@ use crate::arch::x86_64::kernel::virtio_net;
 use crate::arch::x86_64::mm::paging;
 use crate::config::VIRTIO_MAX_QUEUE_SIZE;
 
+use crate::synch::std_mutex::Mutex;
 use alloc::boxed::Box;
 use alloc::rc::Rc;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::convert::TryInto;
@@ -67,13 +69,16 @@ pub struct Virtq<'a> {
 	// The actial descriptors (16 bytes each)
 	virtq_desc: VirtqDescriptors,
 	// A ring of available descriptor heads with free-running index
-	avail: Rc<RefCell<VirtqAvail<'a>>>,
+	avail: Arc<Mutex<VirtqAvail<'a>>>,
 	// A ring of used descriptor heads with free-running index
-	used: Rc<RefCell<VirtqUsed<'a>>>,
+	used: Arc<Mutex<VirtqUsed<'a>>>,
 	// Address where queue index is written to on notify
 	queue_notify_address: &'a mut u16,
 }
 
+// TODO: is this SEND correct?. Needed because of Rc's in descriptors...
+// Send -> Save to use with different threads at different times.
+//unsafe impl<'a> Send for Virtq<'a> {}
 impl<'a> Virtq<'a> {
 	// TODO: are the lifetimes correct?
 	fn new(
@@ -88,8 +93,8 @@ impl<'a> Virtq<'a> {
 			index,
 			vqsize,
 			virtq_desc: VirtqDescriptors::new(virtq_desc),
-			avail: Rc::new(RefCell::new(avail)),
-			used: Rc::new(RefCell::new(used)),
+			avail: Arc::new(Mutex::new(avail)),
+			used: Arc::new(Mutex::new(used)),
 			queue_notify_address,
 		}
 	}
@@ -220,7 +225,7 @@ impl<'a> Virtq<'a> {
 		let chainrc = self.virtq_desc.get_chain_by_index(index);
 		let mut chain = chainrc.borrow_mut();
 
-		let mut vqavail = self.avail.borrow_mut();
+		let mut vqavail = self.avail.lock();
 		let aind = (*vqavail.idx % self.vqsize) as usize;
 		if aind != index {
 			warn!(
@@ -256,7 +261,7 @@ impl<'a> Virtq<'a> {
 		// - After the driver writes a descriptor index into the available ring:
 		//     If flags is 1, the driver SHOULD NOT send a notification.
 		//     If flags is 0, the driver MUST send a notification.
-		let vqused = self.used.borrow();
+		let vqused = self.used.lock();
 		let should_notify = *vqused.flags == 0;
 		drop(vqavail);
 		drop(vqused);
@@ -317,7 +322,7 @@ impl<'a> Virtq<'a> {
 		trace!("Sending Descriptor chain {:?}", chain);
 
 		// 2. The driver places the index of the head of the descriptor chain into the next ring entry of the available ring.
-		let mut vqavail = self.avail.borrow_mut();
+		let mut vqavail = self.avail.lock();
 		let aind = (*vqavail.idx % self.vqsize) as usize;
 		vqavail.ring[aind] = chain.0.first().unwrap().index;
 		// TODO: add multiple descriptor chains at once?
@@ -346,7 +351,7 @@ impl<'a> Virtq<'a> {
 		// - After the driver writes a descriptor index into the available ring:
 		//     If flags is 1, the driver SHOULD NOT send a notification.
 		//     If flags is 0, the driver MUST send a notification.
-		let vqused = self.used.borrow();
+		let vqused = self.used.lock();
 		let should_notify = *vqused.flags == 0;
 		drop(vqavail);
 		drop(vqused);
@@ -356,7 +361,7 @@ impl<'a> Virtq<'a> {
 		}
 
 		// wait until done (placed in used buffer)
-		let mut vqused = self.used.borrow_mut();
+		let mut vqused = self.used.lock();
 		vqused.wait_until_done(&chain);
 
 		// give chain back, so we can reuse the descriptors!
@@ -365,7 +370,7 @@ impl<'a> Virtq<'a> {
 	}
 
 	pub fn check_used_elements(&mut self) -> Option<u32> {
-		let mut vqused = self.used.borrow_mut();
+		let mut vqused = self.used.lock();
 		vqused.check_elements()
 	}
 
@@ -378,7 +383,7 @@ impl<'a> Virtq<'a> {
 		rsp.len = len.try_into().unwrap();
 		rsp.flags = flags;
 
-		let mut vqavail = self.avail.borrow_mut();
+		let mut vqavail = self.avail.lock();
 		if flags != 0 {
 			let aind = (*vqavail.idx % self.vqsize) as usize;
 			vqavail.ring[aind] = chain.0.first().unwrap().index;
@@ -399,20 +404,20 @@ impl<'a> Virtq<'a> {
 	}
 
 	pub fn has_packet(&self) -> bool {
-		let vqused = self.used.borrow();
+		let vqused = self.used.lock();
 
 		vqused.last_idx != *vqused.idx
 	}
 
 	pub fn get_available_buffer(&self) -> Result<u32, ()> {
-		let vqavail = self.avail.borrow();
+		let vqavail = self.avail.lock();
 		let index = *vqavail.idx % self.vqsize;
 
 		Ok(index as u32)
 	}
 
 	pub fn get_used_buffer(&self) -> Result<(u32, u32), ()> {
-		let vqused = self.used.borrow();
+		let vqused = self.used.lock();
 
 		if vqused.last_idx != *vqused.idx {
 			let used_index = vqused.last_idx as usize;
@@ -425,14 +430,14 @@ impl<'a> Virtq<'a> {
 	}
 
 	pub fn buffer_consumed(&mut self) {
-		let mut vqused = self.used.borrow_mut();
+		let mut vqused = self.used.lock();
 
 		if vqused.last_idx != *vqused.idx {
 			let usedelem = vqused.ring[vqused.last_idx as usize % vqused.ring.len()];
 
 			vqused.last_idx = vqused.last_idx.wrapping_add(1);
 
-			let mut vqavail = self.avail.borrow_mut();
+			let mut vqavail = self.avail.lock();
 			let aind = (*vqavail.idx % self.vqsize) as usize;
 			vqavail.ring[aind] = usedelem.id.try_into().unwrap();
 
@@ -512,6 +517,9 @@ struct VirtqDescriptors {
 	used_chains: RefCell<Vec<Rc<RefCell<VirtqDescriptorChain>>>>,
 }
 
+// TODO: this SEND is incorrect!. but temporarily needed to make virtq compile as Send
+// Send -> Save to use with different threads at different times.
+unsafe impl Send for VirtqDescriptors {}
 impl VirtqDescriptors {
 	fn new(descr_raw: Vec<Box<virtq_desc_raw>>) -> Self {
 		VirtqDescriptors {
@@ -710,12 +718,18 @@ pub struct VirtioNotification {
 	pub notify_off_multiplier: u32,
 }
 
+// TODO: is this SEND correct?. Needed because of raw pointer.
+// Send -> Save to use with different threads at different times.
+unsafe impl Send for VirtioSharedMemory {}
 #[derive(Debug)]
 pub struct VirtioSharedMemory {
 	pub addr: *mut usize,
 	pub len: u64,
 }
 
+// TODO: is this SEND correct?. Needed because of raw pointer.
+// Send -> Save to use with different threads at different times.
+unsafe impl Send for VirtioNotification {}
 impl VirtioNotification {
 	pub fn get_notify_addr(&self, queue_notify_off: u32) -> &'static mut u16 {
 		// divide by 2 since notification_ptr is a u16 pointer but we have byte offset

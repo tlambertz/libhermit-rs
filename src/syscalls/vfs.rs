@@ -52,6 +52,13 @@ Open Questions:
 // TODO: lazy static could be replaced with explicit init on OS boot.
 pub static FILESYSTEM: VirtualFilesystem = VirtualFilesystem::new();
 
+// Verify that VirtualFilesystem is SEND, needed cause Spinlock is unsound
+#[allow(dead_code)]
+static GLOBAL_WHICH_IS_SEND_AND_SYNC_1: Option<Mutex<BTreeMap<String, Box<dyn PosixFileSystem>>>> =
+	None;
+#[allow(dead_code)]
+static GLOBAL_WHICH_IS_SEND_AND_SYNC_2: Option<Mutex<FileMap>> = None;
+
 pub struct VirtualFilesystem {
 	// Keep track of mount-points
 	mounts: Spinlock<BTreeMap<String, Box<dyn PosixFileSystem>>>,
@@ -294,13 +301,13 @@ pub enum FileError {
 	EIO,
 }
 
-pub trait PosixFileSystem {
+pub trait PosixFileSystem: Send {
 	fn open(&self, _path: &str, _perms: FilePerms) -> Result<Box<dyn PosixFile>, FileError>;
 	fn unlink(&self, _path: &str) -> Result<(), FileError>;
 	fn stat(&self, path: &str) -> Result<Stat, FileError>;
 }
 
-pub trait PosixFile {
+pub trait PosixFile: Send {
 	fn close(&mut self) -> Result<(), FileError>;
 	fn read(&mut self, buf: &mut [u8]) -> Result<usize, FileError>;
 	fn write(&mut self, buf: &[u8]) -> Result<usize, FileError>;

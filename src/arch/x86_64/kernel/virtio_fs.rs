@@ -15,10 +15,11 @@ use crate::util;
 
 use super::fuse_dax::DaxAllocator;
 use alloc::boxed::Box;
-use alloc::rc::Rc;
 use alloc::vec::Vec;
-use core::cell::RefCell;
 use core::{fmt, u32, u8};
+
+use crate::synch::std_mutex::Mutex;
+use alloc::sync::Arc;
 
 pub const VIRTIO_FS_SHMCAP_ID_CACHE: u8 = 0;
 
@@ -238,7 +239,7 @@ fn get_device_config(adapter: &pci::PciAdapter) -> Result<&'static mut virtio_fs
 
 pub fn create_virtiofs_driver(
 	adapter: &pci::PciAdapter,
-) -> Result<Rc<RefCell<VirtioFsDriver<'static>>>, ()> {
+) -> Result<Arc<Mutex<VirtioFsDriver<'static>>>, ()> {
 	// Scan capabilities to get common config, which we need to reset the device and get basic info.
 	// also see https://elixir.bootlin.com/linux/latest/source/drivers/virtio/virtio_pci_modern.c#L581 (virtio_pci_modern_probe)
 	// Read status register
@@ -286,7 +287,7 @@ pub fn create_virtiofs_driver(
 	// TODO: also load the other 2 cap types (?).
 
 	// Instanciate driver on heap, so it outlives this function
-	let drv = Rc::new(RefCell::new(VirtioFsDriver {
+	let drv = Arc::new(Mutex::new(VirtioFsDriver {
 		common_cfg,
 		device_cfg,
 		notify_cfg,
@@ -295,11 +296,11 @@ pub fn create_virtiofs_driver(
 	}));
 
 	trace!("Driver before init: {:?}", drv);
-	drv.borrow_mut().init();
+	drv.lock().init();
 	trace!("Driver after init: {:?}", drv);
 
 	// Instanciate global fuse object
-	let mut fuse = if let Some(shm) = &drv.borrow().shm_cfg {
+	let mut fuse = if let Some(shm) = &drv.lock().shm_cfg {
 		info!("Found Cache! Using DAX! {:?}", shm);
 		let dax_allocator = DaxAllocator::new(shm.addr as u64, shm.len);
 		Fuse::new_with_dax(drv.clone(), dax_allocator)
