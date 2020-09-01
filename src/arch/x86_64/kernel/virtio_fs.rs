@@ -47,7 +47,7 @@ pub struct VirtioFsDriver<'a> {
 	device_cfg: &'a virtio_fs_config,
 	notify_cfg: VirtioNotification,
 	shm_cfg: Option<VirtioSharedMemory>,
-	vqueues: Option<Vec<Virtq<'a>>>,
+	vqueues: Vec<Arc<Virtq<'a>>>,
 }
 
 impl<'a> fmt::Debug for VirtioFsDriver<'a> {
@@ -56,9 +56,10 @@ impl<'a> fmt::Debug for VirtioFsDriver<'a> {
 		write!(f, "common_cfg: {:?}, ", self.common_cfg)?;
 		write!(f, "device_cfg: {:?}, ", self.device_cfg)?;
 		write!(f, "nofity_cfg: {:?}, ", self.notify_cfg)?;
-		match &self.vqueues {
-			None => write!(f, "Uninitialized VQs")?,
-			Some(vqs) => write!(f, "Initialized {} VQs", vqs.len())?,
+		if self.vqueues.is_empty() {
+			write!(f, "Uninitialized VQs")?;
+		} else {
+			write!(f, "Initialized {} VQs", self.vqueues.len())?;
 		}
 		write!(f, " }}")
 	}
@@ -80,16 +81,13 @@ impl VirtioFsDriver<'_> {
 		}
 		// 1 highprio queue, and n normal request queues
 		let vqnum = device_cfg.num_request_queues + 1;
-		let mut vqueues = Vec::<Virtq>::new();
 
 		// create the queues and tell device about them
 		for i in 0..vqnum as u16 {
 			// TODO: catch error
 			let vq = Virtq::new_from_common(i, common_cfg, notify_cfg).unwrap();
-			vqueues.push(vq);
+			self.vqueues.push(Arc::new(vq));
 		}
-
-		self.vqueues = Some(vqueues);
 	}
 
 	pub fn negotiate_features(&mut self) {
@@ -169,13 +167,15 @@ impl VirtioFsDriver<'_> {
 }
 
 impl FuseInterface for VirtioFsDriver<'_> {
+	/// Dont swap polling on/off!
 	fn send_recv_buffers_blocking(
 		&mut self,
 		to_host: &[&[u8]],
 		from_host: &[&mut [u8]],
+		polling: bool,
 	) -> Result<(), ()> {
-		if let Some(ref mut vqueues) = self.vqueues {
-			vqueues[1].send_blocking(to_host, Some(from_host));
+		if let Some(queue) = self.vqueues.get(1) {
+			queue.send_blocking(to_host, Some(from_host), polling);
 		}
 		Ok(())
 	}
@@ -292,7 +292,7 @@ pub fn create_virtiofs_driver(
 		device_cfg,
 		notify_cfg,
 		shm_cfg,
-		vqueues: None,
+		vqueues: Vec::new(),
 	}));
 
 	trace!("Driver before init: {:?}", drv);
