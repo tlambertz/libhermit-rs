@@ -28,9 +28,9 @@ const FUSE_ROOT_ID: u64 = 1;
 const MAX_BUFFER_SIZE: usize = 0x1000 * 256;
 const USE_POLLING: bool = true;
 
-pub trait FuseInterface: Send {
+pub trait FuseInterface: Send + Sync {
 	fn send_recv_buffers_blocking(
-		&mut self,
+		&self,
 		to_host: &[&[u8]],
 		from_host: &[&mut [u8]],
 		polling: bool,
@@ -39,7 +39,7 @@ pub trait FuseInterface: Send {
 
 /// Driver which can easily be copied into a FuseFile
 /// Abstracts sending of a command over FuseInterface's byte arrays send/recv.
-struct FuseDriver<T: FuseInterface>(Arc<Mutex<T>>);
+struct FuseDriver<T: FuseInterface>(Arc<T>);
 
 impl<T: FuseInterface> FuseDriver<T> {
 	/// Send a command via the fuse driver and get the response.
@@ -59,7 +59,6 @@ impl<T: FuseInterface> FuseDriver<T> {
 
 		// Send the buffers
 		self.0
-			.lock()
 			.send_recv_buffers_blocking(&to_host, &from_host, USE_POLLING)
 			.map_err(|_| FileError::EIO)?;
 
@@ -83,7 +82,6 @@ impl<T: FuseInterface> FuseDriver<T> {
 
 		// Send the buffers
 		self.0
-			.lock()
 			.send_recv_buffers_blocking(&to_host, &[], USE_POLLING)
 			.map_err(|_| FileError::EIO)
 	}
@@ -205,7 +203,7 @@ impl<T: FuseInterface + 'static> PosixFileSystem for Fuse<T> {
 }
 
 impl<T: FuseInterface + 'static> Fuse<T> {
-	pub fn new(driver: Arc<Mutex<T>>) -> Self {
+	pub fn new(driver: Arc<T>) -> Self {
 		Self {
 			driver: FuseDriver(driver),
 			dax_allocator: None,
@@ -213,7 +211,7 @@ impl<T: FuseInterface + 'static> Fuse<T> {
 		}
 	}
 
-	pub fn new_with_dax(driver: Arc<Mutex<T>>, dax_allocator: DaxAllocator) -> Self {
+	pub fn new_with_dax(driver: Arc<T>, dax_allocator: DaxAllocator) -> Self {
 		Self {
 			driver: FuseDriver(driver),
 			dax_allocator: Some(Arc::new(Mutex::new(dax_allocator))),
@@ -222,6 +220,7 @@ impl<T: FuseInterface + 'static> Fuse<T> {
 	}
 
 	pub fn send_init(&mut self) {
+		trace!("SENDING FUSE INIT!");
 		let (cmd, rsp) = create_init();
 		let rsp = self.driver.handle_request(cmd, rsp);
 		trace!("fuse init answer: {:?}", rsp);

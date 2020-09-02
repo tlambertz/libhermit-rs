@@ -48,6 +48,7 @@ pub const PCI_HEADER_TYPE_MASK: u32 = 0x007F_0000;
 pub const PCI_MULTIFUNCTION_MASK: u32 = 0x0080_0000;
 
 pub const PCI_CAP_ID_VNDR: u8 = 0x09;
+pub const PCI_CAP_ID_MSIX: u8 = 0x11;
 
 static PCI_ADAPTERS: SpinlockIrqSave<Vec<PciAdapter>> = SpinlockIrqSave::new(Vec::new());
 static PCI_DRIVERS: SpinlockIrqSave<Vec<PciDriver>> = SpinlockIrqSave::new(Vec::new());
@@ -136,6 +137,15 @@ impl<'a> PciCapability<'a> {
 			self.adapter.device,
 			self.capoffset + offset,
 		)
+	}
+
+	pub fn write_u16(&self, offset: u32, value: u16) {
+		write_config_u16(
+			self.adapter.bus,
+			self.adapter.device,
+			self.capoffset + offset,
+			value,
+		);
 	}
 }
 
@@ -265,6 +275,15 @@ fn parse_bars(bus: u8, device: u8, vendor_id: u16, device_id: u16) -> Vec<PciBar
 	}
 
 	bars
+}
+
+#[repr(packed)]
+#[derive(Debug, Copy, Clone)]
+struct MsixTableEntry {
+	message_address_low: u32,
+	message_address_high: u32,
+	data: u32,
+	control: u32,
 }
 
 impl PciAdapter {
@@ -404,12 +423,12 @@ impl PciAdapter {
 			index, pci_bar.addr, pci_bar.size
 		);
 
-		if pci_bar.width != 64 {
+		/*if pci_bar.width != 64 {
 			warn!("Currently only mapping of 64 bit bars is supported!");
 			return None;
-		}
-		if !pci_bar.prefetchable {
-			warn!("Currently only mapping of prefetchable bars is supported!")
+		}*/
+		if !pci_bar.prefetchable && !no_cache {
+			warn!("Not pretechable bar mapped with cache! Is this indented?")
 		}
 
 		// Since the bios/bootloader manages the physical address space, the address got from the bar is unique and not overlapping.
@@ -420,6 +439,122 @@ impl PciAdapter {
 
 		Some((virtual_address, pci_bar.size))
 	}
+
+	pub fn get_msix_config(&self) -> Option<()> {
+		if let Some(cap) = self.scan_capabilities(
+			Some(PCI_CAP_ID_MSIX),
+			&mut |cap: PciCapability| -> Option<PciCapability> {
+				return Some(cap);
+
+				// corrosponding setup in eg Qemu @ https://github.com/qemu/qemu/blob/master/hw/virtio/virtio-pci.c#L1590 (virtio_pci_device_plugged)
+				//if let Some((virtualbaraddr, size)) = self.memory_map_bar(baridx, no_cache) {
+				/*// we are vendor defined, with virtio vendor --> we can check for virtio cap type
+				let captypeword = cap.read_offset(0);
+				let captype = (captypeword >> 24) & 0xFF;
+				debug!("found vendor, virtio type: {}", captype);
+				if captype == virtiocaptype {
+					// Type matches, now check ID if given
+					if let Some(tid) = id {
+						let cid: u8 = ((cap.read_offset(4) >> 8) & 0xFF) as u8; // get offset_of!(virtio_pci_cap, id)
+						if cid == tid {
+							// cap and id match, return cap
+							return Some(cap);
+						}
+					} else {
+						// dont check ID, we have found cap
+						return Some(cap);
+					}
+				}
+				trace!("No MSI-X cap found");
+				None*/
+			},
+		) {
+			// MSI-X Capability found.
+
+			// MSI-X Table resides in a BAR
+			let table_full: u32 = cap.read_offset(4);
+			let table_bar = (table_full & 0b111) as u8;
+			let table_offset = (table_full & !0b111) as usize;
+			info!(
+				"MSI Table BAR {:#x}, table OFFSET {:#x}",
+				table_bar, table_offset
+			);
+
+			let control = (cap.read_offset(0) >> 16) as u16;
+			let table_size = (control & (2048 - 1)) as usize; // 11 bits
+			info!("MSI Control Register: {:#x}", control);
+
+			// Used for notifications about pending (/masked) interrupts. Not implemented yet.
+			let _pending_bit_array = cap.read_offset(8);
+
+			if let Some((addr, len)) = self.memory_map_bar(table_bar, true) {
+				// We have mapped the area!
+
+				// Construct MSI-X table
+				assert!(len - table_offset >= table_size * 4 * 4); // Each table entry is 4x32bit
+				let mut table = unsafe {
+					core::slice::from_raw_parts_mut(
+						(addr + table_offset) as *mut MsixTableEntry,
+						table_size,
+					)
+				};
+
+				let (data, addr) = arch_msi_address(32 + 5, 0, false, false);
+				//self.irq = 5;
+				table[0].message_address_high = 0;
+				table[0].message_address_low = addr;
+				table[0].control = 0;
+				table[0].data = data;
+
+				info!("Writing DATA and ADDR as {:#x} {:#x}", data, addr);
+
+				// Enable MSI-X by writing to message control field.
+				// set MSI Enable
+				let control = 1 << 15 | control;
+				cap.write_u16(2, control);
+
+				let control = (cap.read_offset(0) >> 16) as u16;
+				info!("new MSI Control Register: {:#x}", control);
+
+			//return Ok((addr, len))
+			} else {
+				error!("Failed to map MSI Bar!");
+			}
+		}
+
+		/*Ok(VirtioSharedMemory {
+			addr: addr as *mut usize,
+			len: len as u64,
+		})*/
+		Some(())
+	}
+}
+
+///
+/// Address format
+/// 31   20  19            12  11         4   3    2  0
+/// 0FEEH    Destination ID    Reserved   RH  DM   XX
+///
+/// Data format
+/// 63     16   15   14   13     11  10          8  7   0
+/// Reserved    TM   LM   Reserved   Delivery mode  Vector
+///
+pub fn arch_msi_address(
+	vector: u32,
+	processor: u32,
+	edgetrigger: bool,
+	deassert: bool,
+) -> (u32, u32) {
+	let mut data = vector & 0xFF;
+	if !edgetrigger {
+		data |= 1 << 15
+	}
+	if !deassert {
+		data |= 1 << 14
+	}
+	let addr = 0xFEE00000 | (processor << 12);
+
+	(data, addr)
 }
 
 impl fmt::Display for PciBar {
@@ -512,6 +647,15 @@ pub fn write_config(bus: u8, device: u8, register: u32, data: u32) {
 	unsafe {
 		outl(PCI_CONFIG_ADDRESS_PORT, address);
 		outl(PCI_CONFIG_DATA_PORT, data);
+	}
+}
+
+pub fn write_config_u16(bus: u8, device: u8, register: u32, data: u16) {
+	let address =
+		PCI_CONFIG_ADDRESS_ENABLE | u32::from(bus) << 16 | u32::from(device) << 11 | register;
+	unsafe {
+		outl(PCI_CONFIG_ADDRESS_PORT, address);
+		outw(PCI_CONFIG_DATA_PORT, data);
 	}
 }
 
