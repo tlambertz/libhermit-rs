@@ -5,10 +5,14 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
+use crate::arch::x86_64::kernel::apic;
 use crate::arch::x86_64::kernel::fuse::{Fuse, FuseInterface};
+use crate::arch::x86_64::kernel::irq::*;
 use crate::arch::x86_64::kernel::pci;
+use crate::arch::x86_64::kernel::percore::{core_scheduler, increment_irq_counter};
 use crate::arch::x86_64::kernel::virtio::{
-	self, consts::*, virtio_pci_common_cfg, VirtioNotification, VirtioSharedMemory, Virtq,
+	self, consts::*, virtio_pci_common_cfg, VirtioISRConfig, VirtioNotification,
+	VirtioSharedMemory, Virtq,
 };
 use crate::syscalls::vfs;
 use crate::util;
@@ -42,20 +46,28 @@ impl fmt::Debug for virtio_fs_config {
 	}
 }
 
-pub struct VirtioFsDriver<'a> {
+pub static mut ISR_CFG: Option<&'static mut VirtioISRConfig> = None;
+
+struct InnerConfig<'a> {
 	common_cfg: &'a mut virtio_pci_common_cfg,
 	device_cfg: &'a virtio_fs_config,
 	notify_cfg: VirtioNotification,
+	//isr_cfg: &'a mut VirtioISRConfig,
 	shm_cfg: Option<VirtioSharedMemory>,
-	vqueues: Vec<Arc<Virtq<'a>>>,
+}
+
+pub struct VirtioFsDriver<'a> {
+	config: Mutex<InnerConfig<'a>>,
+	vqueues: Arc<Vec<Virtq<'a>>>,
 }
 
 impl<'a> fmt::Debug for VirtioFsDriver<'a> {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		let config = self.config.lock();
 		write!(f, "VirtioFsDriver {{ ")?;
-		write!(f, "common_cfg: {:?}, ", self.common_cfg)?;
-		write!(f, "device_cfg: {:?}, ", self.device_cfg)?;
-		write!(f, "nofity_cfg: {:?}, ", self.notify_cfg)?;
+		write!(f, "common_cfg: {:?}, ", config.common_cfg)?;
+		write!(f, "device_cfg: {:?}, ", config.device_cfg)?;
+		write!(f, "nofity_cfg: {:?}, ", config.notify_cfg)?;
 		if self.vqueues.is_empty() {
 			write!(f, "Uninitialized VQs")?;
 		} else {
@@ -65,8 +77,8 @@ impl<'a> fmt::Debug for VirtioFsDriver<'a> {
 	}
 }
 
-impl VirtioFsDriver<'_> {
-	pub fn init_vqs(&mut self) {
+impl<'a> InnerConfig<'a> {
+	pub fn init_vqs(&mut self) -> Result<Vec<Virtq<'static>>, ()> {
 		let common_cfg = &mut self.common_cfg;
 		let device_cfg = &self.device_cfg;
 		let notify_cfg = &mut self.notify_cfg;
@@ -77,17 +89,20 @@ impl VirtioFsDriver<'_> {
 
 		if device_cfg.num_request_queues == 0 {
 			error!("0 request queues requested from device. Aborting!");
-			return;
+			return Err(());
 		}
 		// 1 highprio queue, and n normal request queues
 		let vqnum = device_cfg.num_request_queues + 1;
+		let mut vqueues = Vec::<Virtq>::new();
 
 		// create the queues and tell device about them
 		for i in 0..vqnum as u16 {
 			// TODO: catch error
 			let vq = Virtq::new_from_common(i, common_cfg, notify_cfg).unwrap();
-			self.vqueues.push(Arc::new(vq));
+			vqueues.push(vq);
 		}
+
+		Ok(vqueues)
 	}
 
 	pub fn negotiate_features(&mut self) {
@@ -132,7 +147,7 @@ impl VirtioFsDriver<'_> {
 	}
 
 	/// 3.1 VirtIO Device Initialization
-	pub fn init(&mut self) {
+	pub fn init(&mut self) -> Result<Vec<Virtq<'static>>, ()> {
 		// 1.Reset the device.
 		self.common_cfg.device_status = 0;
 
@@ -154,22 +169,55 @@ impl VirtioFsDriver<'_> {
 		//   otherwise, the device does not support our subset of features and the device is unusable.
 		if self.common_cfg.device_status & 8 == 0 {
 			error!("Device unset FEATURES_OK, aborting!");
-			return;
+			return Err(());
 		}
 
 		// 7.Perform device-specific setup, including discovery of virtqueues for the device, optional per-bus setup,
 		//   reading and possibly writing the device’s virtio configuration space, and population of virtqueues.
-		self.init_vqs();
+		let vqueues = self.init_vqs()?;
+
+		// Disable MSI-X interrupt for config changes
+		self.common_cfg.msix_config = NO_VECTOR;
 
 		// 8.Set the DRIVER_OK status bit. At this point the device is “live”.
 		self.common_cfg.device_status |= 4;
+
+		Ok(vqueues)
+	}
+}
+
+impl<'a> VirtioFsDriver<'a> {
+	pub fn handle_interrupt(&self) -> bool {
+		// When not using MSI-X interrupts, the interrupt has to be acknowledged by reading the ISR status field
+		trace!("Got virtio-fs interrupt!");
+
+		if let Some(queue) = self.vqueues.get(1) {
+			let check_scheduler = queue.check_interrupt();
+
+			if check_scheduler {
+				core_scheduler().scheduler();
+			}
+		}
+
+		/*unsafe{
+			if let Some(ref status) = ISR_CFG {
+				let isr_status = core::ptr::read_volatile(*status);
+				info!("---------INERRUPT_________ {:#x}", isr_status);
+
+				if (isr_status & 0x1) == 0x1 {
+					return true;
+				}
+			}
+		}*/
+
+		false
 	}
 }
 
 impl FuseInterface for VirtioFsDriver<'_> {
 	/// Dont swap polling on/off!
 	fn send_recv_buffers_blocking(
-		&mut self,
+		&self,
 		to_host: &[&[u8]],
 		from_host: &[&mut [u8]],
 		polling: bool,
@@ -239,7 +287,7 @@ fn get_device_config(adapter: &pci::PciAdapter) -> Result<&'static mut virtio_fs
 
 pub fn create_virtiofs_driver(
 	adapter: &pci::PciAdapter,
-) -> Result<Arc<Mutex<VirtioFsDriver<'static>>>, ()> {
+) -> Result<Arc<VirtioFsDriver<'static>>, ()> {
 	// Scan capabilities to get common config, which we need to reset the device and get basic info.
 	// also see https://elixir.bootlin.com/linux/latest/source/drivers/virtio/virtio_pci_modern.c#L581 (virtio_pci_modern_probe)
 	// Read status register
@@ -277,6 +325,12 @@ pub fn create_virtiofs_driver(
 	};
 
 	let shm_cfg = virtio::get_shm_config(adapter, VIRTIO_FS_SHMCAP_ID_CACHE).ok();
+	let isr_cfg = if let Some(i) = virtio::get_isr_config(adapter).ok() {
+		i
+	} else {
+		error!("Could not find VIRTIO_PCI_CAP_ISR_CFG. Aborting!");
+		return Err(());
+	};
 
 	if let Some(shm) = &shm_cfg {
 		info!("Found Cache! Using DAX! {:?}", shm);
@@ -284,23 +338,47 @@ pub fn create_virtiofs_driver(
 		info!("No Cache found, not using DAX!");
 	}
 
-	// TODO: also load the other 2 cap types (?).
+	info!("Getting msi config...");
+	adapter.get_msix_config();
 
-	// Instanciate driver on heap, so it outlives this function
-	let drv = Arc::new(Mutex::new(VirtioFsDriver {
+	let mut config = InnerConfig {
 		common_cfg,
 		device_cfg,
 		notify_cfg,
+		//isr_cfg,
 		shm_cfg,
-		vqueues: Vec::new(),
-	}));
+	};
 
-	trace!("Driver before init: {:?}", drv);
-	drv.lock().init();
+	let vqueues = config.init()?;
+
+	// Instanciate driver on heap, so it outlives this function
+	let drv = VirtioFsDriver {
+		config: Mutex::new(config),
+		vqueues: Arc::new(vqueues),
+	};
+	unsafe {
+		ISR_CFG = Some(isr_cfg);
+	}
+
+	//trace!("Driver before init: {:?}", drv);
+	//drv.init();
 	trace!("Driver after init: {:?}", drv);
 
+	let drv = Arc::new(drv);
+
+	// Place driver in global struct, so interrupt handler can reach it
+	unsafe {
+		VIRTIO_FS_DRIVER = Some(drv.clone());
+	}
+
+	// Register interrupt handler
+	let irqnum = 5u32; // TODO: don't just hardcode 5 here!
+	unsafe { VIRTIO_FS_IRQ_NO = irqnum };
+	irq_install_handler(irqnum, virtiofs_irqhandler as usize);
+	add_irq_name(irqnum, "virtiofs");
+
 	// Instanciate global fuse object
-	let mut fuse = if let Some(shm) = &drv.lock().shm_cfg {
+	let mut fuse = if let Some(shm) = &drv.config.lock().shm_cfg {
 		info!("Found Cache! Using DAX! {:?}", shm);
 		let dax_allocator = DaxAllocator::new(shm.addr as u64, shm.len);
 		Fuse::new_with_dax(drv.clone(), dax_allocator)
@@ -319,4 +397,27 @@ pub fn create_virtiofs_driver(
 		.expect("Mount failed. Duplicate tag?");
 
 	Ok(drv)
+}
+
+static mut VIRTIO_FS_IRQ_NO: u32 = 0;
+static mut VIRTIO_FS_DRIVER: Option<Arc<VirtioFsDriver>> = None;
+
+#[cfg(target_arch = "x86_64")]
+extern "x86-interrupt" fn virtiofs_irqhandler(_stack_frame: &mut ExceptionStackFrame) {
+	trace!("Receive virtio-fs interrupt");
+	increment_irq_counter((32 + unsafe { VIRTIO_FS_IRQ_NO as u8 }).into());
+
+	if let Some(drv) = unsafe { &VIRTIO_FS_DRIVER } {
+		drv.handle_interrupt();
+	}
+	//info!("interrupt done for!");
+
+	// Need to signal end-of-interrupt, even is MSI-X is used
+	apic::eoi();
+
+	//info!("interrupt done for123!");
+
+	/*if check_scheduler {
+		core_scheduler().scheduler();
+	}*/
 }

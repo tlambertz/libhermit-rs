@@ -64,6 +64,8 @@ pub mod consts {
 	// The Guest uses this in flag to advise the Host: don't interrupt me
 	// when you consume a buffer.
 	pub const VRING_AVAIL_F_NO_INTERRUPT: u16 = 1;
+
+	pub const NO_VECTOR: u16 = 0xffff;
 }
 
 pub struct Virtq<'a> {
@@ -166,6 +168,10 @@ impl<'a> Virtq<'a> {
 		//   vector into queue_msix_vector. Read queue_msix_vector:
 		//   on success, previously written value is returned; on failure, NO_VECTOR value is returned.
 
+		// For now, all queues use the first interrupt vector
+		common_cfg.queue_msix_vector = 0;
+		assert!(unsafe { core::ptr::read_volatile(&common_cfg.queue_msix_vector) == 0 });
+
 		// Split buffers into usable structs:
 		let (avail_flags, avail_mem) = avail_mem.split_first_mut().unwrap();
 		let (avail_idx, avail_mem) = avail_mem.split_first_mut().unwrap();
@@ -211,6 +217,13 @@ impl<'a> Virtq<'a> {
 		Some(vq)
 	}
 
+	/// Called when an interrupt happens on the queue.
+	/// Checks new element and wakes appropriate thread
+	/// Returns true if any threads were woken
+	pub fn check_interrupt(&self) -> bool {
+		self.used.check_new_and_wake()
+	}
+
 	fn notify_device(&self) {
 		// 4.1.4.4.1 Device Requirements: Notification capability
 		// virtio-fs does NOT offer VIRTIO_F_NOTIFICATION_DATA
@@ -249,7 +262,7 @@ impl<'a> Virtq<'a> {
 		// The available idx is increased by the number of descriptor chain heads added to the available ring.
 		// idx always increments, and wraps naturally at 65536:
 
-		*vqavail.flags = VRING_AVAIL_F_NO_INTERRUPT;
+		*vqavail.flags = 0; //VRING_AVAIL_F_NO_INTERRUPT;
 		*vqavail.idx = vqavail.idx.wrapping_add(1);
 
 		if *vqavail.idx == 0 {
@@ -281,6 +294,15 @@ impl<'a> Virtq<'a> {
 	/// Uses interior mutability.
 	/// Dont swap polling on/off!
 	pub fn send_blocking(&self, dat: &[&[u8]], rsp_buf: Option<&[&mut [u8]]>, polling: bool) {
+		let mut vqavail = self.avail.lock();
+
+		// TODO: don't do this update very time we send something?
+		if polling {
+			*vqavail.flags = VRING_AVAIL_F_NO_INTERRUPT;
+		} else {
+			*vqavail.flags = 0;
+		}
+
 		// 2.6.13 Supplying Buffers to The Device
 		// The driver offers buffers to one of the device’s virtqueues as follows:
 
@@ -328,7 +350,6 @@ impl<'a> Virtq<'a> {
 		trace!("Sending Descriptor chain {:?}", chain);
 
 		// 2. The driver places the index of the head of the descriptor chain into the next ring entry of the available ring.
-		let mut vqavail = self.avail.lock();
 		let aind = (*vqavail.idx % self.vqsize) as usize;
 		vqavail.ring[aind] = chain.0.first().unwrap().index;
 		// TODO: add multiple descriptor chains at once?
@@ -649,6 +670,30 @@ impl<'a> VirtqUsed<'a> {
 		}
 	}*/
 
+	/// Checks if a new items have arrived, wakes threads if necessary
+	/// Currently only checks ONE (the immediate next) element!
+	/// Returns true if any threads were woken
+	fn check_new_and_wake(&self) -> bool {
+		let next_idx = self.next_to_be_processed_idx.load(Ordering::Relaxed);
+		if unsafe { core::ptr::read_volatile(self.idx) } != next_idx {
+			// something new found
+			let usedelem = self.ring[next_idx as usize % self.ring.len()];
+			let new_desc_idx = usedelem.id;
+			trace!("Found new desc of id {}", new_desc_idx);
+
+			if let Some(semaphore) = self.waiting.lock().remove(&(new_desc_idx as u16)) {
+				semaphore.release();
+				return true;
+			} else {
+				debug!("WARNING: GOT INTERRUPT FOR NON-EXISTING WAITING THREAD!");
+				//debug!("this is only okay, when the interrupt arrived very fast, so no receiver is yet registered");
+				// above needs feature in wait_until_chain_used!
+				return false;
+			}
+		}
+		return false;
+	}
+
 	/// Waits until a descriptor chain is done.
 	/// Returns only once it has been placed in the used-buffer by the device.
 	///
@@ -715,6 +760,8 @@ impl<'a> VirtqUsed<'a> {
 			}
 		}
 
+		// TODO: check all indizes between next_processed and current index, in case this handler is registered too late!
+
 		// We are NOT polling, so we reschedule until an interrupt wakes us again.
 		let semaphore = Arc::new(Semaphore::new(1));
 		// Aquire semaphore once ourselves. This one will be released by the interrupt.
@@ -725,24 +772,24 @@ impl<'a> VirtqUsed<'a> {
 			.lock()
 			.insert(target_idx as u16, semaphore.clone());
 
+		trace!("Waiting until {} is ready", target_idx);
 		// Aquire semaphore again, so we are paused until the interrupt
 		semaphore.acquire(None);
 
 		// When we get here, the interrupt has woken us
 		trace!("Woken from interrupt");
 
-		// since we force in-order processing, the next item after last_processed should be ours
-		let next_idx = self
-			.next_to_be_processed_idx
-			.load(Ordering::SeqCst)
-			.wrapping_add(1);
-		let usedelem = self.ring[next_idx as usize % self.ring.len()];
+		// since we force in-order processing, next_to_be_processed_idx should be ours
+		let current_idx = self.next_to_be_processed_idx.load(Ordering::SeqCst);
+		let usedelem = self.ring[current_idx as usize % self.ring.len()];
 		let new_desc_idx = usedelem.id;
+		trace!("Got index {}", new_desc_idx);
 
 		// Assert that nothing has gone terribly wrong
 		assert!(new_desc_idx == target_idx);
 
 		// Acknowlege that we have processed the buffer by increasing last_processed by one
+		let next_idx = current_idx.wrapping_add(1);
 		let oldval = self
 			.next_to_be_processed_idx
 			.swap(next_idx, Ordering::SeqCst);
@@ -822,6 +869,8 @@ pub struct VirtioSharedMemory {
 	pub addr: *mut usize,
 	pub len: u64,
 }
+
+pub type VirtioISRConfig = u32;
 
 // TODO: is this SEND correct?. Needed because of raw pointer.
 // Send -> Save to use with different threads at different times.
@@ -944,6 +993,13 @@ pub fn get_common_config(
 	Ok(cfg)
 }
 
+pub fn get_isr_config(adapter: &PciAdapter) -> Result<&'static mut VirtioISRConfig, ()> {
+	let cap = find_virtiocap(adapter, VIRTIO_PCI_CAP_ISR_CFG, None)?;
+	let (addr, len) = map_cap(adapter, &cap, false)?;
+	assert!(len >= 1);
+	unsafe { Ok(&mut *(addr as *mut VirtioISRConfig)) }
+}
+
 /// Scans pci-capabilities for a virtio-capability of type virtiocaptype.
 /// When found, maps it into memory and returns virtual address, else None
 pub fn map_virtiocap(
@@ -1007,6 +1063,13 @@ pub fn init_virtio_device(adapter: &pci::PciAdapter) {
 							// TODO: proper error handling on driver creation fail
 							let drv = virtio_net::create_virtionet_driver(adapter).unwrap();
 							pci::register_driver(PciDriver::VirtioNet(drv));
+
+							// Install net-specific interrupt handler
+							unsafe {
+								VIRTIO_NET_IRQ_NO = adapter.irq;
+							}
+							irq_install_handler(adapter.irq as u32, virtio_irqhandler as usize);
+							add_irq_name(adapter.irq as u32, "virtionet");
 						}
 						_ => {
 							warn!("Virtio device is NOT supported, skipping!");
@@ -1024,7 +1087,7 @@ pub fn init_virtio_device(adapter: &pci::PciAdapter) {
 			info!("Found Virtio-FS device!");
 			// TODO: check subclass
 			// TODO: proper error handling on driver creation fail
-			virtio_fs::create_virtiofs_driver(adapter).unwrap();
+			let _drv = virtio_fs::create_virtiofs_driver(adapter).unwrap();
 		}
 		_ => {
 			warn!("Virtio device is NOT supported, skipping!");
@@ -1032,22 +1095,17 @@ pub fn init_virtio_device(adapter: &pci::PciAdapter) {
 		}
 	};
 
-	// Install interrupt handler
-	unsafe {
-		VIRTIO_IRQ_NO = adapter.irq;
-	}
-	irq_install_handler(adapter.irq as u32, virtio_irqhandler as usize);
-	add_irq_name(adapter.irq as u32, "virtio");
+	// TODO: create generic interrupt handler
 }
 
 /// Specifies the interrupt number of the virtio device
-static mut VIRTIO_IRQ_NO: u8 = 0;
+static mut VIRTIO_NET_IRQ_NO: u8 = 0;
 
 #[cfg(target_arch = "x86_64")]
 extern "x86-interrupt" fn virtio_irqhandler(_stack_frame: &mut ExceptionStackFrame) {
 	debug!("Receive virtio interrupt");
 	apic::eoi();
-	increment_irq_counter((32 + unsafe { VIRTIO_IRQ_NO }).into());
+	increment_irq_counter((32 + unsafe { VIRTIO_NET_IRQ_NO }).into());
 
 	let check_scheduler = match get_network_driver() {
 		Some(driver) => driver.borrow_mut().handle_interrupt(),
