@@ -393,7 +393,7 @@ impl<T: FuseInterface> FuseFile<T> {
 			len = self.connection_options.max_bufsize;
 		}
 		if let Some(fh) = self.fuse_fh {
-			let (cmd, rsp) = create_write(fh, &buf[..len], self.offset as u64);
+			let (cmd, rsp) = create_write(self.fuse_nid.unwrap(), fh, &buf[..len], self.offset as u64);
 			let rsp = self.driver.handle_request(cmd, rsp)?;
 			trace!("write response: {:?}", rsp);
 
@@ -756,10 +756,12 @@ struct AlignToPage([u8; 4096]);
 //          Using references, i have to be careful of lifetimes!
 pub fn create_write(
 	nid: u64,
+	fh: u64,
 	buf: &[u8],
 	offset: u64,
 ) -> (Cmd<fuse_write_in>, Rsp<fuse_write_out>) {
 	let cmd = fuse_write_in {
+		fh: fh,
 		offset,
 		size: buf.len() as u32,
 		..Default::default()
