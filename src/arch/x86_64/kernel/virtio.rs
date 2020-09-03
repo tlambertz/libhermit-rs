@@ -28,7 +28,7 @@ use core::cell::RefCell;
 use core::convert::TryInto;
 use core::sync::atomic::spin_loop_hint;
 use core::sync::atomic::AtomicU16;
-use core::sync::atomic::{fence, Ordering};
+use core::sync::atomic::{fence, Ordering, AtomicU64};
 
 use self::consts::*;
 
@@ -204,6 +204,8 @@ impl<'a> Virtq<'a> {
 			//rawmem: used_mem_box,
 			next_to_be_processed_idx: AtomicU16::new(0),
 			waiting: Mutex::new(BTreeMap::new()),
+			skipped_idxs: Mutex::new(Vec::new()),
+			generation: AtomicU64::new(0),
 		};
 		let vq = Virtq::new(
 			index,
@@ -653,6 +655,12 @@ struct VirtqUsed<'a> {
 
 	// Map of semaphores, which block threads that are waiting for the associated descriptor id.
 	waiting: Mutex<BTreeMap<u16, Arc<Semaphore>>>,
+
+	// Map of descriptor indices skipped over while processing.
+	skipped_idxs: Mutex<Vec<u32>>,
+
+	// integer increated whenever skipped_idxs is updated. So it can be quickly polled.
+	generation: AtomicU64,
 }
 
 impl<'a> VirtqUsed<'a> {
@@ -671,101 +679,179 @@ impl<'a> VirtqUsed<'a> {
 	}*/
 
 	/// Checks if a new items have arrived, wakes threads if necessary
-	/// Wakes all threads for all available entries. Does NOT advance the next_to_be_processed_id
+	/// Wakes all threads for all available entries. Does advance the next_to_be_processed_id
 	/// Returns true if any threads were woken
+	///
+	/// called by interrupt handler
 	fn check_new_and_wake(&self) -> bool {
-		let next_idx = self.next_to_be_processed_idx.load(Ordering::Relaxed);
-		let current_q_idx = unsafe {core::ptr::read_volatile(self.idx) };
+		let mut next_idx = self.next_to_be_processed_idx.load(Ordering::Relaxed);
 		let mut found = false;
-		for idx in next_idx..current_q_idx {
-			// something new found
-			let usedelem = self.ring[idx as usize % self.ring.len()];
-			let new_desc_idx = usedelem.id;
-			trace!("Found new desc of id {} at index {} , current_idx is {}", new_desc_idx, idx, current_q_idx);
 
-			if let Some(semaphore) = self.waiting.lock().remove(&(new_desc_idx as u16)) {
+		// There might be multile updates in one interrupt, so loop.
+		loop {
+			let current_q_idx = unsafe {core::ptr::read_volatile(self.idx) };
+			trace!("Interrupt sees queue index as {}", current_q_idx);
+			if next_idx == current_q_idx {
+				// Either spurious wake or all event processed. just return
+				trace!("queue interrupt is done");
+				break;
+			}
+
+			// Queue index is greater than the processed_idx, so we try to process one element.
+	
+			// There might be other consumers listening on the queue. They are sync'd via next_to_be_processed_idx
+			// Update next index. Do an atomic compare with the old value to assure we are the only done doing this update right now.
+			let oldval = self
+				.next_to_be_processed_idx
+				.compare_and_swap(next_idx, next_idx.wrapping_add(1), Ordering::Relaxed);
+	
+			// Check if we are the first one to process this index.
+			if(oldval != next_idx) {
+				// Somebody else was faster than us. Try again
+				continue;
+			}
+			
+			// something new found, and WE are processor for the next_idx element
+			trace!("Interrupt is processing queue element!");
+			let usedelem = self.ring[next_idx as usize % self.ring.len()];
+			let new_desc_idx = usedelem.id;
+			trace!("Found new desc of id {} at index {} , current_idx is {}", new_desc_idx, next_idx, current_q_idx);
+
+			let sema = self.waiting.lock().remove(&(new_desc_idx as u16));
+			if let Some(semaphore) = sema {
 				semaphore.release();
 				found = true;
 			} else {
-				debug!("WARNING: GOT INTERRUPT FOR NON-EXISTING WAITING THREAD!");
-				//debug!("this is only okay, when the interrupt arrived very fast, so no receiver is yet registered");
-				// above needs feature in wait_until_chain_used!
+				trace!("Interrupt arrived for non-registered index! (might be polling?)");
+				let mut skip = self.skipped_idxs.lock();
+				self.generation.fetch_add(1, Ordering::SeqCst);
+				skip.push(new_desc_idx);
+				drop(skip);
 			}
+
+			next_idx = next_idx.wrapping_add(1);
 		}
+		
 		found
 	}
 
-	/// Waits until a descriptor chain is done.
-	/// Returns only once it has been placed in the used-buffer by the device.
+	/// Waits until a descriptor chain is done. There is a polling and a non-polling version
 	///
-	/// EVERY chain HAS to be checked EXACTLY ONCE for completion, else this implementation breaks!
+	/// When a descriptor chain is done, the device will place its index in the used buffer
+	/// There might be multiple consumers which read look for updates in this buffer.
+	/// Either interrupts, or polling threads. Through an atomic variable it is ensured
+	/// that each used-buffer-update is processed exactly once.
 	///
-	/// TODO: ensure there is only one polling thread at a time? It currently works, but that might be more efficient
+	/// There are THREE different things that can happen when processing one such update.
+	/// 1. The update is exactly the one the current handler is waiting for. It can just exit and resume execution.
+	/// 2. The update is for some registered listener. This listener is blocking on a semaphore, which can now be lifted.
+	///    This will allow the other listener to continue its execution once it is resumed
+	/// 3. There is NO known listener! The event is stuffed in a list of skipped events
+	///
+	/// This means that EVERY chain HAS to be checked EXACTLY ONCE for completion, 
+	/// else this implementation gets slow, since the skipped events list grows.
+	///
 	fn wait_until_chain_used(&self, chain: &VirtqDescriptorChain, polling: bool) {
 		// This is the target index we are waiting to appear in the used buffer
 		let target_idx = chain.0.first().unwrap().index as u32;
+		trace!("Waiting until chain {} is used!", target_idx);
 		let next_idx = self.next_to_be_processed_idx.load(Ordering::Relaxed);
+		let mut current_generation: u64 = self.generation.load(Ordering::Relaxed);
 
-		// If we are polling
+		// If we are polling, try fast-path once. Otherwise fall back to interrupt ??? WRONG
 		while polling {
-			// Poll until we see a change in the buffers index
-			while unsafe { core::ptr::read_volatile(self.idx) } == next_idx {
-				spin_loop_hint();
+			// Poll until we see a change in the buffers index. Keep an eye on the skipped_idx list
+			trace!("Entering polling loop!");
+			loop {
+				if unsafe { core::ptr::read_volatile(self.idx) } != next_idx {
+					// Queue update
+					break;
+				}
+				let new_generation = self.generation.load(Ordering::Relaxed);
+				if new_generation!= current_generation {
+					// Update to list of skipped elements
+					// Check if this is relevant for us. THIS IS HORRIBLE if multiple threads are polling simultaneously!
+					let mut skip = self.skipped_idxs.lock();
+					let index = skip.iter().position(|&s| s == target_idx);
+					if let Some(index) = index {
+						debug!("Found the target index in skipped list while polling!");
+						skip.swap_remove(index);
+						return;
+					} else {
+						trace!("Processed useless skip-list update");
+						current_generation = new_generation;
+					}
+					drop(skip);
+				}
 			}
+			// We are here since the queue index has increased.
 			// See which descriptor-index the new used descriptor has
 			trace!("Seen new descriptor at index {}!", next_idx);
+
+			// Update next index. Do an atomic compare with the old value to assure we are the only done doing this update right now.
+			let oldval = self
+				.next_to_be_processed_idx
+				.compare_and_swap(next_idx, next_idx.wrapping_add(1), Ordering::Relaxed);
+
+			// Check if we are the first one to process this index.
+			if(oldval != next_idx) {
+				// Somebody else was faster than us. Just continue polling
+				continue;
+			}
+			trace!("Polling is processing queue element {}!", next_idx);
+
+			// We are processing the new descriptor. load info about it
 			let usedelem = self.ring[next_idx as usize % self.ring.len()];
 			let new_desc_idx = usedelem.id;
 			trace!("New desc is of id {}", new_desc_idx);
 
-			// Update next index
-			let next_idx = next_idx.wrapping_add(1);
-
 			// Now there have two options
 			if new_desc_idx == target_idx {
+				// A) The buffer is the one we want to see. We are done and can return
 				trace!("Correct descriptor!");
-				// A) The buffer is the one we want to see.
-				//    Consume the buffer by increasing the last processed index
-				let oldval = self
-					.next_to_be_processed_idx
-					.swap(next_idx, Ordering::Relaxed);
-
-				// Assert that nothing has gone terribly wrong. We should still have the old next_to_be_processed_idx.
-				assert!(oldval.wrapping_add(1) == next_idx);
-
-				// Return, to exit polling
 				return;
 			} else {
 				trace!("Wrong descriptor, expecting {}!", target_idx);
-				// B) This is the wrong buffer! This means someone else is likely processing this one.
-				//    If nobody else is, we enter an endless loop!
-				debug!("See wrong buffer! Waiting for next element to be ready! This might be an endless loop, if no other consumer checks for completion!");
+				// B) This is the wrong buffer! This means someone else is likely wants this one. 
+				//    Either wake them, or place it into skipped list.
+				debug!("See wrong buffer! Either waking appropriate thread, or process it into skipped list.");
 
 				// Wake threads which were waiting on the current id to become available if there are any
-				if let Some(semaphore) = self.waiting.lock().remove(&(target_idx as u16)) {
+				// This is an optimization, so we avoid using the skipped-list too much.
+				let sema = self.waiting.lock().remove(&(new_desc_idx as u16));
+				if let Some(semaphore) = sema {
 					semaphore.release();
+				} else {
+					// No threads available, push for a later thread.
+					trace!("Interrupt arrived for non-registered index! (might be polling?)");
+					let mut skip = self.skipped_idxs.lock();
+
+					// Check if our index has been place into the list. Might happen if something races, but here we are locked and safe!
+					let index = skip.iter().position(|&s| s == target_idx);
+					if let Some(index) = index {
+						debug!("Found the target index in skipped list while polling!");
+						skip.swap_remove(index);
+					}
+
+					current_generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+					skip.push(new_desc_idx);
+					drop(skip);
+
+					// If we have found ourselves in the list, we are done
+					if index.is_some() {
+						return;
+					}
 				}
 
-				// Wait until something else handles the buffer which we are not. This is suboptimal, because it forces in-order processing of events
-				// In practice, this should not make a difference, since users (hopefully) always register a completion listener for their buffers
-				// TODO: is this really slow because of atomics?
-				while self.next_to_be_processed_idx.load(Ordering::Relaxed) != next_idx {
-					info!("Rescheduling, since not buffer not available yet!");
-					core_scheduler().scheduler();
-				}
-
-				// Alternative: Update our own next_idx, so we poll for the next element to become ready.
-				// But then we would have to keep a list of "ahead of time" processed elements.
-
-				// Someone else has handeled the buffer, fall-through and try again on the next buffer.
+				// As we are here, nobody else has processed our target_idx into the waiting list, go back to polling.
 			}
 		}
 
-		// TODO: check all indizes between next_processed and current index, in case this handler is registered too late!
-
-		// We are NOT polling, so we reschedule until an interrupt wakes us again.
+		// We are NOT polling.
+		// First register us as a thread waiting for a buffer, but do not go to sleep yet.
+		
 		let semaphore = Arc::new(Semaphore::new(1));
-		// Aquire semaphore once ourselves. This one will be released by the interrupt.
+		// Aquire semaphore once ourselves. This one will be released only when someone else sees our target_idx.
 		semaphore.acquire(None);
 
 		// Place semaphore into waiting map.
@@ -773,37 +859,26 @@ impl<'a> VirtqUsed<'a> {
 			.lock()
 			.insert(target_idx as u16, semaphore.clone());
 
-		trace!("Waiting until {} is ready", target_idx);
+
+		// Now we can check if somebody has seen our index before we were registered and placed in into the skipped list
+		trace!("Checking skipped list!");
+		let mut skip = self.skipped_idxs.lock();
+		let index = skip.iter().position(|&s| s == target_idx);
+		if let Some(index) = index {
+			debug!("Found the target index in skipped list while polling!");
+			skip.swap_remove(index);
+			return;
+		}
+		drop(skip);
+
+		trace!("Sleeping until {} is ready", target_idx);
+
 		// Aquire semaphore again, so we are paused until the interrupt
 		semaphore.acquire(None);
 
-		// When we get here, the interrupt has woken us
+		// When we get here, the interrupt has woken us. This means he has seen the target_idx directly and explicitly unlocked us.
+		// This means that we are safe to just be done. Nobody is allowed to release the semaphore in any other case!
 		trace!("Woken from interrupt");
-
-		// since we force in-order processing, next_to_be_processed_idx should be ours
-		let next_idx = loop {
-			let current_idx = self.next_to_be_processed_idx.load(Ordering::SeqCst);
-			let usedelem = self.ring[current_idx as usize % self.ring.len()];
-			let new_desc_idx = usedelem.id;
-			trace!("Got index {} want index {}", new_desc_idx, target_idx);
-	
-			// If multiple thread are awoken at once, this next_idx might be the wrong one.
-			// Reschedule and try again after the 'first' thread is done
-			if new_desc_idx != target_idx {
-				core_scheduler().scheduler();
-			} else {
-				break current_idx.wrapping_add(1);
-			}
-		};
-		
-
-		// Acknowlege that we have processed the buffer by increasing last_processed by one
-		let oldval = self
-			.next_to_be_processed_idx
-			.swap(next_idx, Ordering::SeqCst);
-
-		// Assert that nothing has gone terribly wrong
-		assert!(oldval.wrapping_add(1) == next_idx);
 	}
 }
 
