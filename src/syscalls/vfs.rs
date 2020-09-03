@@ -5,7 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-use crate::synch::spinlock::Spinlock;
+//use crate::synch::spinlock::Spinlock;
 use crate::synch::std_mutex::Mutex;
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
@@ -61,10 +61,10 @@ static GLOBAL_WHICH_IS_SEND_AND_SYNC_2: Option<Mutex<FileMap>> = None;
 
 pub struct VirtualFilesystem {
 	// Keep track of mount-points
-	mounts: Spinlock<BTreeMap<String, Box<dyn PosixFileSystem>>>,
+	mounts: Mutex<BTreeMap<String, Box<dyn PosixFileSystem>>>,
 
 	// Keep track of open files
-	files: Spinlock<FileMap>,
+	files: Mutex<FileMap>,
 }
 
 type LockableFile = Arc<Mutex<Box<dyn PosixFile>>>;
@@ -132,8 +132,8 @@ fn parse_path(path: &str) -> Result<(&str, &str), FileError> {
 impl VirtualFilesystem {
 	pub const fn new() -> Self {
 		Self {
-			mounts: Spinlock::new(BTreeMap::new()),
-			files: Spinlock::new(FileMap::new()),
+			mounts: Mutex::new(BTreeMap::new()),
+			files: Mutex::new(FileMap::new()),
 		}
 	}
 

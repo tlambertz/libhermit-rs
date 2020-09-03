@@ -1,5 +1,4 @@
 use crate::synch::semaphore::Semaphore;
-use alloc::boxed::Box;
 use core::cell::UnsafeCell;
 use core::fmt;
 use core::mem;
@@ -9,12 +8,7 @@ use core::ptr;
 /// MUTEX based on STDLIB, but MODIFIED to work in the kernel! Might be subtily broken!
 /// Since the Poison feature is removed, the API is different!
 pub struct Mutex<T: ?Sized> {
-	// Note that this mutex is in a *box*, not inlined into the struct itself.
-	// Once a native mutex has been used once, its address can never change (it
-	// can't be moved). This mutex type can be safely moved at any time, so to
-	// ensure that the native mutex is used correctly we box the inner mutex to
-	// give it a constant address.
-	inner: Box<Semaphore>,
+	inner: Semaphore,
 	data: UnsafeCell<T>,
 }
 
@@ -32,9 +26,9 @@ impl<T: ?Sized> !Send for MutexGuard<'_, T> {}
 unsafe impl<T: ?Sized + Sync> Sync for MutexGuard<'_, T> {}
 
 impl<T> Mutex<T> {
-	pub fn new(t: T) -> Mutex<T> {
+	pub const fn new(t: T) -> Mutex<T> {
 		Mutex {
-			inner: Box::new(Semaphore::new(1)),
+			inner: Semaphore::new(1),
 			data: UnsafeCell::new(t),
 		}
 	}

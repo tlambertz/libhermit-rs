@@ -671,27 +671,28 @@ impl<'a> VirtqUsed<'a> {
 	}*/
 
 	/// Checks if a new items have arrived, wakes threads if necessary
-	/// Currently only checks ONE (the immediate next) element!
+	/// Wakes all threads for all available entries. Does NOT advance the next_to_be_processed_id
 	/// Returns true if any threads were woken
 	fn check_new_and_wake(&self) -> bool {
 		let next_idx = self.next_to_be_processed_idx.load(Ordering::Relaxed);
-		if unsafe { core::ptr::read_volatile(self.idx) } != next_idx {
+		let current_q_idx = unsafe {core::ptr::read_volatile(self.idx) };
+		let mut found = false;
+		for idx in next_idx..current_q_idx {
 			// something new found
-			let usedelem = self.ring[next_idx as usize % self.ring.len()];
+			let usedelem = self.ring[idx as usize % self.ring.len()];
 			let new_desc_idx = usedelem.id;
-			trace!("Found new desc of id {}", new_desc_idx);
+			trace!("Found new desc of id {} at index {} , current_idx is {}", new_desc_idx, idx, current_q_idx);
 
 			if let Some(semaphore) = self.waiting.lock().remove(&(new_desc_idx as u16)) {
 				semaphore.release();
-				return true;
+				found = true;
 			} else {
 				debug!("WARNING: GOT INTERRUPT FOR NON-EXISTING WAITING THREAD!");
 				//debug!("this is only okay, when the interrupt arrived very fast, so no receiver is yet registered");
 				// above needs feature in wait_until_chain_used!
-				return false;
 			}
 		}
-		return false;
+		found
 	}
 
 	/// Waits until a descriptor chain is done.
@@ -780,19 +781,28 @@ impl<'a> VirtqUsed<'a> {
 		trace!("Woken from interrupt");
 
 		// since we force in-order processing, next_to_be_processed_idx should be ours
-		let current_idx = self.next_to_be_processed_idx.load(Ordering::SeqCst);
-		let usedelem = self.ring[current_idx as usize % self.ring.len()];
-		let new_desc_idx = usedelem.id;
-		trace!("Got index {}", new_desc_idx);
-
-		// Assert that nothing has gone terribly wrong
-		assert!(new_desc_idx == target_idx);
+		let next_idx = loop {
+			let current_idx = self.next_to_be_processed_idx.load(Ordering::SeqCst);
+			let usedelem = self.ring[current_idx as usize % self.ring.len()];
+			let new_desc_idx = usedelem.id;
+			trace!("Got index {} want index {}", new_desc_idx, target_idx);
+	
+			// If multiple thread are awoken at once, this next_idx might be the wrong one.
+			// Reschedule and try again after the 'first' thread is done
+			if new_desc_idx != target_idx {
+				core_scheduler().scheduler();
+			} else {
+				break current_idx.wrapping_add(1);
+			}
+		};
+		
 
 		// Acknowlege that we have processed the buffer by increasing last_processed by one
-		let next_idx = current_idx.wrapping_add(1);
 		let oldval = self
 			.next_to_be_processed_idx
 			.swap(next_idx, Ordering::SeqCst);
+
+		// Assert that nothing has gone terribly wrong
 		assert!(oldval.wrapping_add(1) == next_idx);
 	}
 }
