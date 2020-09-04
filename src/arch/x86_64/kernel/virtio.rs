@@ -21,14 +21,11 @@ use crate::synch::semaphore::Semaphore;
 use crate::synch::std_mutex::Mutex;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
-use alloc::rc::Rc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::cell::RefCell;
 use core::convert::TryInto;
-use core::sync::atomic::spin_loop_hint;
 use core::sync::atomic::AtomicU16;
-use core::sync::atomic::{fence, Ordering, AtomicU64};
+use core::sync::atomic::{fence, AtomicPtr, AtomicU64, Ordering};
 
 use self::consts::*;
 
@@ -203,9 +200,12 @@ impl<'a> Virtq<'a> {
 			ring: unsafe { core::slice::from_raw_parts(used_mem.as_ptr() as *const _, vqsize) },
 			//rawmem: used_mem_box,
 			next_to_be_processed_idx: AtomicU16::new(0),
-			waiting: Mutex::new(BTreeMap::new()),
-			skipped_idxs: Mutex::new(Vec::new()),
+			state: Mutex::new(QueueState {
+				waiting: BTreeMap::new(),
+				skipped_idxs: Vec::new(),
+			}),
 			generation: AtomicU64::new(0),
+			interrupt_wake: AtomicPtr::new(0 as *mut Semaphore),
 		};
 		let vq = Virtq::new(
 			index,
@@ -238,7 +238,7 @@ impl<'a> Virtq<'a> {
 	}
 
 	// Places dat in virtq, waits until buffer is used and response is in rsp_buf.
-	pub fn send_non_blocking(&mut self, index: usize, len: usize) -> Result<(), ()> {
+	pub fn send_non_blocking(&mut self, _index: usize, _len: usize) -> Result<(), ()> {
 		/*// data is already stored in the TxBuffers => we have only to inform the host
 		// that a new buffer is available
 
@@ -594,7 +594,9 @@ impl VirtqDescriptors {
 
 		// Remove chain from used list
 		// Two Arcs are equal if their inner values are equal, even if they are stored in different allocation.
-		let index = used.iter().position(|c| Arc::as_ptr(c) == Arc::as_ptr(&chain));
+		let index = used
+			.iter()
+			.position(|c| Arc::as_ptr(c) == Arc::as_ptr(&chain));
 		if let Some(index) = index {
 			used.remove(index);
 		} else {
@@ -644,17 +646,72 @@ struct VirtqUsed<'a> {
 	// Last index that has activly been processed
 	next_to_be_processed_idx: AtomicU16,
 
-	// Map of semaphores, which block threads that are waiting for the associated descriptor id.
-	waiting: Mutex<BTreeMap<u16, Arc<Semaphore>>>,
+	state: Mutex<QueueState>,
 
-	// Map of descriptor indices skipped over while processing.
-	skipped_idxs: Mutex<Vec<u32>>,
-
-	// integer increated whenever skipped_idxs is updated. So it can be quickly polled.
+	// integer incremented whenever QueueState is updated in a way useful for other threads. So it can be quickly polled.
 	generation: AtomicU64,
+
+	interrupt_wake: AtomicPtr<Semaphore>,
 }
 
-// TODO: interrupt takes locks. 
+struct QueueState {
+	// Map of semaphores, which block threads that are waiting for the associated descriptor id.
+	waiting: BTreeMap<u16, Arc<Semaphore>>,
+
+	// Map of descriptor indices skipped over while processing.
+	skipped_idxs: Vec<u32>,
+}
+
+impl QueueState {
+	/// Checks if index already in skipped list, removes it if it is.
+	/// Returns true it it is skipped already -> instant return from wait
+	fn check_if_skipped(&mut self, target_idx: u32) -> bool {
+		trace!(
+			"Checking for index {} in skipped list {:?}",
+			target_idx,
+			self.skipped_idxs
+		);
+		self.skipped_idxs.contains(&target_idx)
+	}
+
+	fn ack_skip(&mut self, target_idx: u32) -> bool {
+		trace!(
+			"Checking for index {} in skipped list {:?} with goal to remove it",
+			target_idx,
+			self.skipped_idxs
+		);
+		let index = self.skipped_idxs.iter().position(|&s| s == target_idx);
+		if let Some(index) = index {
+			debug!("Found the target index in skipped list, REMOVING IT!");
+			self.skipped_idxs.swap_remove(index);
+			true
+		} else {
+			false
+		}
+	}
+
+	/// Checks the given list of elements against state.
+	/// If they are waiting, remove them and return the according semaphores.
+	/// Adds all elements into skipped list
+	fn check_elements(&mut self, elements: &[u32]) -> Vec<Arc<Semaphore>> {
+		let mut to_wake = Vec::new();
+		for new_desc_idx in elements {
+			self.skipped_idxs.push(new_desc_idx.clone());
+
+			// Check if somebody else is waiting for exactly this element and wake them
+			let sema = self.waiting.remove(&(new_desc_idx.clone() as u16));
+			if let Some(semaphore) = sema {
+				trace!("Pushing semaphore for thread waiting on {}", new_desc_idx);
+				to_wake.push(semaphore);
+			} else {
+				trace!("Update arrived for non-registered index! (might be polling?)");
+			}
+		}
+		to_wake
+	}
+}
+
+// TODO: interrupt takes locks.
 //       If it is called and interrupts someone else who also holds the lock -> deadlock!
 
 impl<'a> VirtqUsed<'a> {
@@ -678,57 +735,117 @@ impl<'a> VirtqUsed<'a> {
 	///
 	/// called by interrupt handler
 	fn check_new_and_wake(&self) -> bool {
+		// Fetch waker if one is present, clear it at the same time.
+		let towake = self
+			.interrupt_wake
+			.swap(0 as *mut Semaphore, Ordering::SeqCst);
+		if towake != 0 as *mut Semaphore {
+			trace!("Found valid waker, waking now! {:?}", towake);
+			unsafe { (*towake).release() };
+		} else {
+			trace!("Interrupt found no valid waker!");
+		}
+		trace!("Interrupt done. Wake should have happened! {:?}", towake);
+		false
+	}
+
+	/// Checks the current queue directly.
+	/// Optionally checks if target_idx is done
+	fn check_queue(&self, target_idx: Option<u32>) -> bool {
+		// Get index up to which the queue is currently processed
 		let mut next_idx = self.next_to_be_processed_idx.load(Ordering::Relaxed);
+		// List of all new descriptor indices
+		let mut new_idxs = Vec::new();
+		// Keep track if we found target_idx
 		let mut found = false;
 
-		// There might be multiple updates in one interrupt, so loop.
+		// Queue might have multiple updates
 		loop {
-			let current_q_idx = unsafe {core::ptr::read_volatile(self.idx) };
-			trace!("Interrupt sees queue index as {}, next_idx is {}", current_q_idx, next_idx);
+			let current_q_idx = unsafe { core::ptr::read_volatile(self.idx) };
+			trace!(
+				"Update sees queue index as {}, next_idx is {}",
+				current_q_idx,
+				next_idx
+			);
 			if next_idx == current_q_idx {
 				// Either spurious wake or all event processed. just return
-				trace!("queue interrupt is done");
+				trace!("queue updates are done");
 				break;
 			}
 
 			// Queue index is greater than the processed_idx, so we try to process one element.
-	
+
 			// There might be other consumers listening on the queue. They are sync'd via next_to_be_processed_idx
 			// Update next index. Do an atomic compare with the old value to assure we are the only done doing this update right now.
 			let current_idx = next_idx;
 			next_idx = next_idx.wrapping_add(1);
 
 			// Update next index. Do an atomic compare with the old value to assure we are the only done doing this update right now.
-			let oldval = self
-				.next_to_be_processed_idx
-				.compare_and_swap(current_idx, next_idx, Ordering::Relaxed);
+			let oldval = self.next_to_be_processed_idx.compare_and_swap(
+				current_idx,
+				next_idx,
+				Ordering::Relaxed,
+			);
 
 			// Check if we are the first one to process this index.
-			if(oldval != current_idx) {
+			if oldval != current_idx {
 				// Somebody else was faster than us. Try again
-				trace!("Somebody else was faster, skipping {}, {}, {}!", next_idx, oldval, current_idx);
+				trace!(
+					"Somebody else was faster, skipping {}, {}, {}!",
+					next_idx,
+					oldval,
+					current_idx
+				);
 				continue;
 			}
-			
+
 			// something new found, and WE are processor for the next_idx element
-			trace!("Interrupt is processing queue element!");
+			trace!("Updater is processing queue element!");
 			let usedelem = self.ring[current_idx as usize % self.ring.len()];
 			let new_desc_idx = usedelem.id;
-			trace!("Found new desc of id {} at index {} , current_idx is {}", new_desc_idx, next_idx, current_q_idx);
+			trace!(
+				"Found new desc of id {} at index {} , current_idx is {}",
+				new_desc_idx,
+				next_idx,
+				current_q_idx
+			);
 
-			let sema = self.waiting.lock().remove(&(new_desc_idx as u16));
-			if let Some(semaphore) = sema {
-				semaphore.release();
-				found = true;
-			} else {
-				trace!("Interrupt arrived for non-registered index! (might be polling?)");
-				let mut skip = self.skipped_idxs.lock();
-				self.generation.fetch_add(1, Ordering::SeqCst);
-				skip.push(new_desc_idx);
-				drop(skip);
+			if let Some(target_idx) = target_idx {
+				if new_desc_idx == target_idx {
+					trace!("Found own index {}!", target_idx);
+					found = true;
+				} else {
+					new_idxs.push(new_desc_idx);
+				}
 			}
 		}
-		
+		trace!("New desc indices: {:?}", new_idxs);
+
+		// Check the list of new elements to see if any threads need to be woken
+		if !new_idxs.is_empty() {
+			let mut state = self.state.lock();
+			let to_wake = state.check_elements(&new_idxs);
+
+			// skipped changed, so update generation
+			self.generation.fetch_add(1, Ordering::SeqCst);
+
+			trace!("Currently skipped: {:?}", state.skipped_idxs);
+			drop(state);
+
+			// Wake all other threads which got an update
+			for semaphore in to_wake {
+				trace!("Waking");
+				// When waking threads, make sure they are not the current interrupt watch, else things might break
+				let wsemptr = semaphore.as_ref() as *const Semaphore as *mut Semaphore;
+				self.interrupt_wake.compare_and_swap(
+					wsemptr,
+					0 as *mut Semaphore,
+					Ordering::SeqCst,
+				);
+				semaphore.release();
+			}
+		}
+
 		found
 	}
 
@@ -745,154 +862,150 @@ impl<'a> VirtqUsed<'a> {
 	///    This will allow the other listener to continue its execution once it is resumed
 	/// 3. There is NO known listener! The event is stuffed in a list of skipped events
 	///
-	/// This means that EVERY chain HAS to be checked EXACTLY ONCE for completion, 
+	/// This means that EVERY chain HAS to be checked EXACTLY ONCE for completion,
 	/// else this implementation gets slow, since the skipped events list grows.
 	///
 	fn wait_until_chain_used(&self, chain: &VirtqDescriptorChain, polling: bool) {
+		if polling {
+			self.wait_until_chain_used_polling(chain);
+		} else {
+			self.wait_until_chain_used_interrupt(chain);
+		}
+	}
+
+	fn wait_until_chain_used_polling(&self, chain: &VirtqDescriptorChain) {
+		// This is the target index we are waiting to appear in the used buffer
+		let target_idx = chain.0.first().unwrap().index as u32;
+		trace!("Waiting with polling until chain {} is used!", target_idx);
+
+		let mut current_generation: u64 = 0;
+
+		// We might need to wait multiple times, so loop
+		loop {
+			// To avoid constantly locking the skip indice list, just check its generation
+			let next_generation: u64 = self.generation.load(Ordering::SeqCst);
+			if current_generation != next_generation {
+				if self.state.lock().check_if_skipped(target_idx) {
+					trace!("Found index in skipped, returning!");
+					// Acknowledge that we have consumed the skip, if it was one
+					self.state.lock().ack_skip(target_idx);
+					break;
+				}
+				current_generation = next_generation;
+			}
+
+			// Check queue for updates
+			let found = self.check_queue(Some(target_idx));
+			if found {
+				break;
+			}
+		}
+
+		trace!("Target descriptor found by polling: {}!", target_idx);
+	}
+
+	fn wait_until_chain_used_interrupt(&self, chain: &VirtqDescriptorChain) {
 		// This is the target index we are waiting to appear in the used buffer
 		let target_idx = chain.0.first().unwrap().index as u32;
 		trace!("Waiting until chain {} is used!", target_idx);
-		let mut next_idx = self.next_to_be_processed_idx.load(Ordering::Relaxed);
-		let mut current_generation: u64 = self.generation.load(Ordering::Relaxed);
 
-		// Check the waiting list for the current generation.
-		trace!("Checking skipped list!");
-		let mut skip = self.skipped_idxs.lock();
-		let index = skip.iter().position(|&s| s == target_idx);
-		if let Some(index) = index {
-			debug!("Found the target index in skipped list while polling!");
-			skip.swap_remove(index);
+		// fast-path: First, check current queue_state if already skipped current target_idx
+		// Current generation will always be the state-generation, which is last checked for skips
+		let mut state = self.state.lock();
+		if state.check_if_skipped(target_idx) {
+			trace!("Immediate return, since skipped already");
 			return;
 		}
-		drop(skip);
+		drop(state);
 
-		// If we are polling, try fast-path once. Otherwise fall back to interrupt ??? WRONG
-		while polling {
-			// Poll until we see a change in the buffers index. Keep an eye on the skipped_idx list
-			trace!("Entering polling loop!");
-			loop {
-				if unsafe { core::ptr::read_volatile(self.idx) } != next_idx {
-					// Queue update
-					break;
-				}
-				let new_generation = self.generation.load(Ordering::Relaxed);
-				if new_generation!= current_generation {
-					// Update to list of skipped elements
-					// Check if this is relevant for us. THIS IS HORRIBLE if multiple threads are polling simultaneously!
-					let mut skip = self.skipped_idxs.lock();
-					let index = skip.iter().position(|&s| s == target_idx);
-					if let Some(index) = index {
-						debug!("Found the target index in skipped list while polling!");
-						skip.swap_remove(index);
-						return;
-					} else {
-						trace!("Processed useless skip-list update");
-						current_generation = new_generation;
-					}
-					drop(skip);
-				}
-			}
-			// We are here since the queue index has increased.
-			// See which descriptor-index the new used descriptor has
-			trace!("Seen new descriptor at index {}!", next_idx);
-			let current_idx = next_idx;
-			next_idx = next_idx.wrapping_add(1);
-
-			// Update next index. Do an atomic compare with the old value to assure we are the only done doing this update right now.
-			let oldval = self
-				.next_to_be_processed_idx
-				.compare_and_swap(current_idx, next_idx, Ordering::Relaxed);
-
-			// Check if we are the first one to process this index.
-			if(oldval != current_idx) {
-				// Somebody else was faster than us. Just continue polling on the next index
-				trace!("Somebody else was faster, skipping {}, {}!", next_idx, oldval);
-				continue;
-			}
-			trace!("Polling is processing queue element {}!", current_idx);
-
-			// We are processing the new descriptor. load info about it
-			let usedelem = self.ring[current_idx as usize % self.ring.len()];
-			let new_desc_idx = usedelem.id;
-			trace!("New desc is of id {}", new_desc_idx);
-
-			// Now there have two options
-			if new_desc_idx == target_idx {
-				// A) The buffer is the one we want to see. We are done and can return
-				trace!("Correct descriptor!");
-				return;
-			} else {
-				trace!("Wrong descriptor, expecting {}!", target_idx);
-				// B) This is the wrong buffer! This means someone else is likely wants this one. 
-				//    Either wake them, or place it into skipped list.
-				debug!("See wrong buffer! Either waking appropriate thread, or process it into skipped list.");
-
-				// Wake threads which were waiting on the current id to become available if there are any
-				// This is an optimization, so we avoid using the skipped-list too much.
-				let sema = self.waiting.lock().remove(&(new_desc_idx as u16));
-				if let Some(semaphore) = sema {
-					semaphore.release();
-				} else {
-					// No threads available, push for a later thread.
-					trace!("Interrupt arrived for non-registered index! (might be polling?)");
-					let mut skip = self.skipped_idxs.lock();
-
-					// Check if our index has been place into the list. Might happen if something races, but here we are locked and safe!
-					let index = skip.iter().position(|&s| s == target_idx);
-					if let Some(index) = index {
-						debug!("Found the target index in skipped list while polling!");
-						skip.swap_remove(index);
-					}
-
-					current_generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-					skip.push(new_desc_idx);
-					drop(skip);
-
-					// If we have found ourselves in the list, we are done
-					if index.is_some() {
-						return;
-					}
-				}
-
-				// As we are here, nobody else has processed our target_idx into the waiting list, go back to polling.
-			}
-		}
-
-		// We are NOT polling.
-		// First register us as a thread waiting for a buffer, but do not go to sleep yet.
-		
+		// Define semaphore, which will be used to block this thread until interrupt later.
 		let semaphore = Arc::new(Semaphore::new(1));
+		let semptr = Arc::as_ptr(&semaphore) as *const Semaphore as *mut Semaphore;
 		// Aquire semaphore once ourselves. This one will be released only when someone else sees our target_idx.
 		semaphore.acquire(None);
 
-		// Place semaphore into waiting map.
-		self.waiting
-			.lock()
-			.insert(target_idx as u16, semaphore.clone());
-		trace!("Inserted watch for {} into waiting list", target_idx);
+		// We might need to wait multiple times, so loop
+		loop {
+			// Place semaphore into waiting map, so we get woken once someone else sees our id.
+			self.state
+				.lock()
+				.waiting
+				.insert(target_idx as u16, semaphore.clone());
+			trace!("Inserted watch for {} into waiting list", target_idx);
 
-		// If the generation of the skipped_idxs list has been updated since we last check, check again!
-		let new_generation = self.generation.load(Ordering::SeqCst);
-		if new_generation != current_generation {
-			trace!("Checking skipped list again, since generation changed!");
-			let mut skip = self.skipped_idxs.lock();
-			let index = skip.iter().position(|&s| s == target_idx);
-			if let Some(index) = index {
-				debug!("Found the target index in skipped list while polling!");
-				skip.swap_remove(index);
-				return;
+			// Place semaphore into interrupt waker, (TODO: if none is there already? does not matter)
+			self.interrupt_wake.store(semptr, Ordering::SeqCst);
+
+			// Check skip indexes again before going to sleep
+			if self.state.lock().check_if_skipped(target_idx) {
+				trace!("Found index in skipped, returning!");
+				break;
 			}
-			drop(skip);
+
+			// Check queue for updates before going to sleep
+			let found = self.check_queue(Some(target_idx));
+			if found {
+				break;
+			}
+
+			// Check skip indexes again before going to sleep
+			if self.state.lock().check_if_skipped(target_idx) {
+				trace!("Found index in skipped, returning!");
+				break;
+			}
+			// Aquire semaphore, so we are paused until the next wake/interrupt
+			// If we have been woken before this, this just continues immediately
+			trace!("Sleeping until {} is ready", target_idx);
+			semaphore.acquire(None);
+
+			// When we get here, an interrupt/other thread has woken us. Something happend on the queue, check what and notify other threads if needed.
+
+			// first, remove ourselves from the waiting list. This is only needed if we are woken by the interrupt.
+			// TODO: there is a small race condition possible here, if we are FIRST woken by an interrupt, then by another thread processing the waiting list
+			self.state.lock().waiting.remove(&(target_idx as u16));
+			trace!("Woken from interrupt");
+
+			// Make sure we are not the current interrupt waker. This should never happen!
+			//let waker = self.interrupt_wake.compare_and_swap(semptr, 0 as *mut Semaphore, Ordering::SeqCst);
+
+			// Now we know that some queue event has taken place. Loop around to parse it, and go to sleep again
 		}
 
-		trace!("Sleeping until {} is ready", target_idx);
+		trace!("Target descriptor found {}!", target_idx);
 
-		// Aquire semaphore again, so we are paused until the interrupt
-		semaphore.acquire(None);
+		// remove ourselves from the waiting list, if we are still on there
+		self.state.lock().waiting.remove(&(target_idx as u16));
 
-		// When we get here, the interrupt has woken us. This means he has seen the target_idx directly and explicitly unlocked us.
-		// This means that we are safe to just be done. Nobody is allowed to release the semaphore in any other case!
-		trace!("Woken from interrupt");
+		// Acknowledge that we have consumed the skip
+		self.state.lock().ack_skip(target_idx);
+
+		// Below is just a sanity check, TODO: remove
+		let mut state = self.state.lock();
+		let mut waiting_idxs = Vec::new();
+		for (idx, _) in state.waiting.iter() {
+			waiting_idxs.push(idx.clone() as u32);
+		}
+		for idx in waiting_idxs {
+			if state.check_if_skipped(idx) {
+				trace!("WOAH WAITING SKIPPED!");
+			}
+		}
+		drop(state);
+
+		// Make sure we are not the current interrupt waker, since we will deallocate the semaphore now!
+		let waker =
+			self.interrupt_wake
+				.compare_and_swap(semptr, 0 as *mut Semaphore, Ordering::SeqCst);
+		// If we were the waker, we need to put someone else in charge
+		if waker == semptr {
+			trace!("Registering new waker to replace us!");
+			if let Some((_, semaphore)) = self.state.lock().waiting.iter().next() {
+				let semptr = Arc::as_ptr(&semaphore) as *const Semaphore as *mut Semaphore;
+				self.interrupt_wake.store(semptr, Ordering::SeqCst);
+			}
+		}
+
+		trace!("Descriptor seen, returning from wait!");
 	}
 }
 
