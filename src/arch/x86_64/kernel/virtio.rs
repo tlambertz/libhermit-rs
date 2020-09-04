@@ -239,11 +239,11 @@ impl<'a> Virtq<'a> {
 
 	// Places dat in virtq, waits until buffer is used and response is in rsp_buf.
 	pub fn send_non_blocking(&mut self, index: usize, len: usize) -> Result<(), ()> {
-		// data is already stored in the TxBuffers => we have only to inform the host
+		/*// data is already stored in the TxBuffers => we have only to inform the host
 		// that a new buffer is available
 
 		let chainrc = self.virtq_desc.get_chain_by_index(index);
-		let mut chain = chainrc.borrow_mut();
+		let mut chain = chainrc.lock();
 
 		let mut vqavail = self.avail.lock();
 		let aind = (*vqavail.idx % self.vqsize) as usize;
@@ -287,7 +287,7 @@ impl<'a> Virtq<'a> {
 		if should_notify {
 			self.notify_device();
 		}
-
+		*/
 		Ok(())
 	}
 
@@ -315,8 +315,8 @@ impl<'a> Virtq<'a> {
 
 		// 1. Get the next free descriptor table entry, d
 		// Choose head=0, since we only do one req. TODO: get actual next free descr table entry
-		let chainrc = self.virtq_desc.get_empty_chain();
-		let mut chain = chainrc.borrow_mut();
+		let safechain = self.virtq_desc.get_empty_chain();
+		let mut chain = safechain.lock();
 		for dat in dat {
 			self.virtq_desc.extend(&mut chain);
 			let req = &mut chain.0.last_mut().unwrap().raw;
@@ -389,10 +389,10 @@ impl<'a> Virtq<'a> {
 
 		// wait until done (placed in used buffer)
 		self.used.wait_until_chain_used(&chain, polling);
-
+		trace!("Wait done, dropping chain!");
 		// give chain back, so we can reuse the descriptors!
 		drop(chain);
-		self.virtq_desc.recycle_chain(chainrc)
+		self.virtq_desc.recycle_chain(safechain);
 	}
 
 	pub fn check_used_elements(&mut self) -> Option<u32> {
@@ -402,7 +402,7 @@ impl<'a> Virtq<'a> {
 
 	pub fn add_buffer(&mut self, index: usize, addr: u64, len: usize, flags: u16) {
 		let chainrc = self.virtq_desc.get_empty_chain();
-		let mut chain = chainrc.borrow_mut();
+		let mut chain = chainrc.lock();
 		self.virtq_desc.extend(&mut chain);
 		let rsp = &mut chain.0.last_mut().unwrap().raw;
 		rsp.addr = paging::virt_to_phys(addr as usize) as u64;
@@ -528,6 +528,8 @@ struct VirtqDescriptor {
 #[derive(Debug)]
 struct VirtqDescriptorChain(Vec<VirtqDescriptor>);
 
+type VirtqDescriptorChainSafe = Arc<Mutex<VirtqDescriptorChain>>;
+
 // Two descriptor chains are equal, if memory address of vec is equal.
 impl PartialEq for VirtqDescriptorChain {
 	fn eq(&self, other: &Self) -> bool {
@@ -541,22 +543,17 @@ struct VirtqDescriptors {
 	//    still need to have them stored in this file somewhere though, cannot be owned by moved-out transfer object.
 	//    So this is best solution?
 	// free contains a single chain of all currently free descriptors.
-	free: RefCell<VirtqDescriptorChain>,
+	free: Mutex<VirtqDescriptorChain>,
 	// a) We want to be able to use nonmutable reference to create new used chain
 	// b) we want to return reference to descriptor chain, eg when creating new!
 	// TODO: improve this type. there should be a better way to accomplish something similar.
-	used_chains: RefCell<Vec<Rc<RefCell<VirtqDescriptorChain>>>>,
+	used_chains: Mutex<Vec<VirtqDescriptorChainSafe>>,
 }
 
-// TODO: this SEND/SYNC is incorrect!. but temporarily needed to make virtq compile as Send
-// Send -> Save to use with different threads at different times.
-unsafe impl Send for VirtqDescriptors {}
-unsafe impl Sync for VirtqDescriptors {}
 impl VirtqDescriptors {
 	fn new(descr_raw: Vec<Box<virtq_desc_raw>>) -> Self {
 		VirtqDescriptors {
-			//descr_raw,
-			free: RefCell::new(VirtqDescriptorChain(
+			free: Mutex::new(VirtqDescriptorChain(
 				descr_raw
 					.into_iter()
 					.enumerate()
@@ -567,50 +564,45 @@ impl VirtqDescriptors {
 					.rev()
 					.collect(),
 			)),
-			used_chains: RefCell::new(Vec::new()),
+			used_chains: Mutex::new(Vec::new()),
 		}
 	}
 
-	fn get_chain_by_index(&self, index: usize) -> Rc<RefCell<VirtqDescriptorChain>> {
+	/*fn get_chain_by_index(&self, index: usize) -> Arc<Mutex<VirtqDescriptorChain>> {
 		let idx = self
 			.used_chains
-			.borrow()
+			.lock()
 			.iter()
-			.position(|c| c.borrow().0.last().unwrap().index == index.try_into().unwrap())
+			.position(|c| c.lock().0.last().unwrap().index == index.try_into().unwrap())
 			.unwrap();
-		self.used_chains.borrow()[idx].clone()
-	}
+		self.used_chains.lock()[idx].clone()
+	}*/
 
 	// Can't guarantee that the caller will pass back the chain to us, so never hand out complete ownership!
-	fn get_empty_chain(&self) -> Rc<RefCell<VirtqDescriptorChain>> {
+	fn get_empty_chain(&self) -> Arc<Mutex<VirtqDescriptorChain>> {
 		// TODO: handle no-free case!
-		//let mut free = self.free.borrow_mut();
-		let mut used = self.used_chains.borrow_mut();
-		let newchain = VirtqDescriptorChain(Vec::new() /*vec![free.0.pop().unwrap()]*/);
-		let cell = Rc::new(RefCell::new(newchain));
-		used.push(cell.clone());
-		//Ref::map(, |mi| &mi.vec)
-		//Ref::map(used.last().unwrap().borrow_mut(), |x| x)
-		//used.last().unwrap().clone()
-		cell
+
+		let chain = Arc::new(Mutex::new(VirtqDescriptorChain(Vec::new())));
+		self.used_chains.lock().push(chain.clone());
+		chain
 	}
 
-	fn recycle_chain(&self, chain: Rc<RefCell<VirtqDescriptorChain>>) {
-		let mut free = self.free.borrow_mut();
-		let mut used = self.used_chains.borrow_mut();
+	fn recycle_chain(&self, chain: Arc<Mutex<VirtqDescriptorChain>>) {
+		let mut used = self.used_chains.lock();
 		//info!("Free chain: {:?}", &free.0[free.0.len()-4..free.0.len()]);
 		//info!("used chain: {:?}", &used);
 
 		// Remove chain from used list
-		// Two Rcs are equal if their inner values are equal, even if they are stored in different allocation.
-		let index = used.iter().position(|c| *c == chain);
+		// Two Arcs are equal if their inner values are equal, even if they are stored in different allocation.
+		let index = used.iter().position(|c| Arc::as_ptr(c) == Arc::as_ptr(&chain));
 		if let Some(index) = index {
 			used.remove(index);
 		} else {
 			warn!("Trying to remove chain from virtq which does not exist!");
 			return;
 		}
-		free.0.append(&mut chain.borrow_mut().0);
+		drop(used);
+		self.free.lock().0.append(&mut chain.lock().0);
 		// chain is now empty! if anyone else still has a reference, he can't do harm
 		// TODO: make test
 		//info!("Free chain: {:?}", &free.0[free.0.len()-4..free.0.len()]);
@@ -619,8 +611,7 @@ impl VirtqDescriptors {
 
 	fn extend(&self, chain: &mut VirtqDescriptorChain) {
 		// TODO: handle no-free case!
-		let mut free = self.free.borrow_mut();
-		let mut next = free.0.pop().unwrap();
+		let mut next = self.free.lock().0.pop().unwrap();
 		if !chain.0.is_empty() {
 			let last = chain.0.last_mut().unwrap();
 			last.raw.next = next.index;
@@ -796,6 +787,7 @@ impl<'a> VirtqUsed<'a> {
 			// Check if we are the first one to process this index.
 			if(oldval != next_idx) {
 				// Somebody else was faster than us. Just continue polling
+				trace!("Somebody else was faster, skipping {}, {}!", next_idx, oldval);
 				continue;
 			}
 			trace!("Polling is processing queue element {}!", next_idx);

@@ -188,8 +188,10 @@ impl<'a> InnerConfig<'a> {
 
 impl<'a> VirtioFsDriver<'a> {
 	pub fn handle_interrupt(&self) -> bool {
-		// When not using MSI-X interrupts, the interrupt has to be acknowledged by reading the ISR status field
 		trace!("Got virtio-fs interrupt!");
+
+		// Spec: The driver MUST handle spurious notifications from the device. 
+		// queues check_interrupt is robust to this
 
 		if let Some(queue) = self.vqueues.get(1) {
 			let check_scheduler = queue.check_interrupt();
@@ -199,6 +201,7 @@ impl<'a> VirtioFsDriver<'a> {
 			}
 		}
 
+		// When not using MSI-X interrupts, the interrupt has to be acknowledged by reading the ISR status field
 		/*unsafe{
 			if let Some(ref status) = ISR_CFG {
 				let isr_status = core::ptr::read_volatile(*status);
