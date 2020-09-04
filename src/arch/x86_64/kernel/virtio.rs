@@ -654,6 +654,9 @@ struct VirtqUsed<'a> {
 	generation: AtomicU64,
 }
 
+// TODO: interrupt takes locks. 
+//       If it is called and interrupts someone else who also holds the lock -> deadlock!
+
 impl<'a> VirtqUsed<'a> {
 	/*fn check_elements(&mut self) -> Option<u32> {
 		let last_idx = self.last_idx.lock();
@@ -678,10 +681,10 @@ impl<'a> VirtqUsed<'a> {
 		let mut next_idx = self.next_to_be_processed_idx.load(Ordering::Relaxed);
 		let mut found = false;
 
-		// There might be multile updates in one interrupt, so loop.
+		// There might be multiple updates in one interrupt, so loop.
 		loop {
 			let current_q_idx = unsafe {core::ptr::read_volatile(self.idx) };
-			trace!("Interrupt sees queue index as {}", current_q_idx);
+			trace!("Interrupt sees queue index as {}, next_idx is {}", current_q_idx, next_idx);
 			if next_idx == current_q_idx {
 				// Either spurious wake or all event processed. just return
 				trace!("queue interrupt is done");
@@ -692,19 +695,24 @@ impl<'a> VirtqUsed<'a> {
 	
 			// There might be other consumers listening on the queue. They are sync'd via next_to_be_processed_idx
 			// Update next index. Do an atomic compare with the old value to assure we are the only done doing this update right now.
+			let current_idx = next_idx;
+			next_idx = next_idx.wrapping_add(1);
+
+			// Update next index. Do an atomic compare with the old value to assure we are the only done doing this update right now.
 			let oldval = self
 				.next_to_be_processed_idx
-				.compare_and_swap(next_idx, next_idx.wrapping_add(1), Ordering::Relaxed);
-	
+				.compare_and_swap(current_idx, next_idx, Ordering::Relaxed);
+
 			// Check if we are the first one to process this index.
-			if(oldval != next_idx) {
+			if(oldval != current_idx) {
 				// Somebody else was faster than us. Try again
+				trace!("Somebody else was faster, skipping {}, {}, {}!", next_idx, oldval, current_idx);
 				continue;
 			}
 			
 			// something new found, and WE are processor for the next_idx element
 			trace!("Interrupt is processing queue element!");
-			let usedelem = self.ring[next_idx as usize % self.ring.len()];
+			let usedelem = self.ring[current_idx as usize % self.ring.len()];
 			let new_desc_idx = usedelem.id;
 			trace!("Found new desc of id {} at index {} , current_idx is {}", new_desc_idx, next_idx, current_q_idx);
 
@@ -719,8 +727,6 @@ impl<'a> VirtqUsed<'a> {
 				skip.push(new_desc_idx);
 				drop(skip);
 			}
-
-			next_idx = next_idx.wrapping_add(1);
 		}
 		
 		found
@@ -748,6 +754,17 @@ impl<'a> VirtqUsed<'a> {
 		trace!("Waiting until chain {} is used!", target_idx);
 		let mut next_idx = self.next_to_be_processed_idx.load(Ordering::Relaxed);
 		let mut current_generation: u64 = self.generation.load(Ordering::Relaxed);
+
+		// Check the waiting list for the current generation.
+		trace!("Checking skipped list!");
+		let mut skip = self.skipped_idxs.lock();
+		let index = skip.iter().position(|&s| s == target_idx);
+		if let Some(index) = index {
+			debug!("Found the target index in skipped list while polling!");
+			skip.swap_remove(index);
+			return;
+		}
+		drop(skip);
 
 		// If we are polling, try fast-path once. Otherwise fall back to interrupt ??? WRONG
 		while polling {
@@ -852,18 +869,21 @@ impl<'a> VirtqUsed<'a> {
 		self.waiting
 			.lock()
 			.insert(target_idx as u16, semaphore.clone());
+		trace!("Inserted watch for {} into waiting list", target_idx);
 
-
-		// Now we can check if somebody has seen our index before we were registered and placed in into the skipped list
-		trace!("Checking skipped list!");
-		let mut skip = self.skipped_idxs.lock();
-		let index = skip.iter().position(|&s| s == target_idx);
-		if let Some(index) = index {
-			debug!("Found the target index in skipped list while polling!");
-			skip.swap_remove(index);
-			return;
+		// If the generation of the skipped_idxs list has been updated since we last check, check again!
+		let new_generation = self.generation.load(Ordering::SeqCst);
+		if new_generation != current_generation {
+			trace!("Checking skipped list again, since generation changed!");
+			let mut skip = self.skipped_idxs.lock();
+			let index = skip.iter().position(|&s| s == target_idx);
+			if let Some(index) = index {
+				debug!("Found the target index in skipped list while polling!");
+				skip.swap_remove(index);
+				return;
+			}
+			drop(skip);
 		}
-		drop(skip);
 
 		trace!("Sleeping until {} is ready", target_idx);
 
