@@ -746,7 +746,7 @@ impl<'a> VirtqUsed<'a> {
 		// This is the target index we are waiting to appear in the used buffer
 		let target_idx = chain.0.first().unwrap().index as u32;
 		trace!("Waiting until chain {} is used!", target_idx);
-		let next_idx = self.next_to_be_processed_idx.load(Ordering::Relaxed);
+		let mut next_idx = self.next_to_be_processed_idx.load(Ordering::Relaxed);
 		let mut current_generation: u64 = self.generation.load(Ordering::Relaxed);
 
 		// If we are polling, try fast-path once. Otherwise fall back to interrupt ??? WRONG
@@ -778,22 +778,24 @@ impl<'a> VirtqUsed<'a> {
 			// We are here since the queue index has increased.
 			// See which descriptor-index the new used descriptor has
 			trace!("Seen new descriptor at index {}!", next_idx);
+			let current_idx = next_idx;
+			next_idx = next_idx.wrapping_add(1);
 
 			// Update next index. Do an atomic compare with the old value to assure we are the only done doing this update right now.
 			let oldval = self
 				.next_to_be_processed_idx
-				.compare_and_swap(next_idx, next_idx.wrapping_add(1), Ordering::Relaxed);
+				.compare_and_swap(current_idx, next_idx, Ordering::Relaxed);
 
 			// Check if we are the first one to process this index.
-			if(oldval != next_idx) {
-				// Somebody else was faster than us. Just continue polling
+			if(oldval != current_idx) {
+				// Somebody else was faster than us. Just continue polling on the next index
 				trace!("Somebody else was faster, skipping {}, {}!", next_idx, oldval);
 				continue;
 			}
-			trace!("Polling is processing queue element {}!", next_idx);
+			trace!("Polling is processing queue element {}!", current_idx);
 
 			// We are processing the new descriptor. load info about it
-			let usedelem = self.ring[next_idx as usize % self.ring.len()];
+			let usedelem = self.ring[current_idx as usize % self.ring.len()];
 			let new_desc_idx = usedelem.id;
 			trace!("New desc is of id {}", new_desc_idx);
 
