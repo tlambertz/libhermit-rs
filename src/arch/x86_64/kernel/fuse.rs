@@ -338,16 +338,10 @@ impl<T: FuseInterface> FuseFile<T> {
 	/// Uses fuse setupmapping to create a DAX mapping, and copies from that. Mappings are cached
 	fn read_dax(&mut self, buf: &mut [u8]) -> Result<usize, FileError> {
 		trace!("read_dax({:x}) from offset {:x}", buf.len(), self.offset);
-		let mut cached = self.get_cached()?.clone();
-		let cached = cached.as_buf(self.offset);
-		trace!("Got dax cache as {:p}", cached.as_ptr());
-		// Limit read length to buffer boundary
-		let mut len = buf.len();
-		if cached.len() < len {
-			len = cached.len();
-		}
+
 
 		// Limit length to file size
+		let mut len = buf.len();
 		if self.offset + len > self.attr.size as usize {
 			trace!(
 				"Limiting file read over EOF: {}, {}, {}",
@@ -358,29 +352,43 @@ impl<T: FuseInterface> FuseFile<T> {
 			len = self.attr.size as usize - self.offset;
 		}
 
-		self.offset += len;
+		// One read might span multiple caches. read from all of them
+		let mut bytes_read = 0;
+		while bytes_read < len {
+			let mut cached = self.get_cached()?.clone();
+			let cached = cached.as_buf(self.offset);
+			trace!("Got dax cache as {:p}", cached.as_ptr());
 
-		// Copy buffer into output.
-		let read_bytes = len;
-		trace!(
-			"Starting dax copy. {:p}, {:#x}, {:p}, {:#x}",
-			buf.as_ptr(),
-			buf.len(),
-			cached.as_ptr(),
-			cached.len()
-		);
+			// Limit read length to buffer boundary
+			let mut to_read = len - bytes_read;
+			if cached.len() < to_read {
+				to_read = cached.len();
+			}
 
-		// Use non-prefetching memcpy implementation
-		//buf[..read_bytes].copy_from_slice(&cached[..len]);
-		unsafe {
-			memcpy_noprefetch(buf.as_mut_ptr(), cached.as_ptr(), len);
+			// Copy buffer into output.
+			trace!(
+				"Starting dax copy. {:p}, {:#x}, {:p}, {:#x}",
+				buf.as_ptr(),
+				buf.len(),
+				cached.as_ptr(),
+				to_read
+			);
+
+			// Use non-prefetching memcpy implementation
+			//buf[bytes_read..bytes_read+to_read].copy_from_slice(&cached[..to_read]);
+			unsafe {
+				memcpy_noprefetch(buf[bytes_read..].as_mut_ptr(), cached.as_ptr(), to_read);
+			}
+
+			self.offset += to_read;
+			bytes_read += to_read;
 		}
 
 		trace!(
 			"read_dax output: {:?} ....",
 			&buf[..core::cmp::min(16, buf.len())]
 		);
-		Ok(read_bytes)
+		Ok(bytes_read)
 	}
 
 	fn write_fuse(&mut self, buf: &[u8]) -> Result<usize, FileError> {
@@ -421,7 +429,7 @@ impl<T: FuseInterface> FuseFile<T> {
 	}
 
 	fn write_dax(&mut self, buf: &[u8]) -> Result<usize, FileError> {
-		let mut len = buf.len() as usize;
+		let len = buf.len() as usize;
 
 		// If write is file-extending, fall back to write_fuse()
 		if self.offset + len > self.attr.size as usize {
@@ -441,31 +449,38 @@ impl<T: FuseInterface> FuseFile<T> {
 			self.attr.size
 		);
 
-		let mut cached = self.get_cached()?.clone();
-		let cached = cached.as_buf(self.offset);
+		// One write might span multiple caches. write all of them
+		let mut currently_written = 0;
+		while currently_written < len {
+			let mut cached = self.get_cached()?.clone();
+			let cached = cached.as_buf(self.offset);
+			
+			let mut to_write = len - currently_written;
+			
+			// Limit write length to buffer boundary
+			if cached.len() < to_write {
+				to_write = cached.len();
+			}
+	
+			// Write buffer into cache.
+			trace!(
+				"copying data to slice! from {:p} to {:p} of len {:x}",
+				buf.as_ptr(),
+				cached.as_ptr(),
+				to_write
+			);
+	
+			// Use non-prefetching memcpy implementation
+			//cached[..to_write].copy_from_slice(&buf[currently_written..currently_written+to_write]);
+			unsafe {
+				memcpy_noprefetch(cached.as_mut_ptr(), buf[currently_written..].as_ptr(), to_write);
+			}
 
-		// Limit write length to buffer boundary
-		if cached.len() < len {
-			len = cached.len();
+			self.offset += to_write;
+			currently_written += to_write;
 		}
 
-		self.offset += len;
-
-		// Write buffer into cache.
-		trace!(
-			"copying data to slice! from {:p} to {:p} of len {:x}",
-			buf.as_ptr(),
-			cached.as_ptr(),
-			len
-		);
-
-		// Use non-prefetching memcpy implementation
-		//cached[..len].copy_from_slice(buf);
-		unsafe {
-			memcpy_noprefetch(cached.as_mut_ptr(), buf.as_ptr(), len);
-		}
-
-		Ok(len)
+		Ok(currently_written)
 	}
 
 	/// Returns true if the file is opened with write flag
@@ -480,7 +495,7 @@ impl<T: FuseInterface> FuseFile<T> {
 			trace!("Already cached dax, fast path. {:?}", entry);
 			return Ok(entry);
 		}
-
+		trace!("Requesting new DAX cache at {}", self.offset);
 		// Offset is not yet mapped, do it now!
 		let entry = cache
 			.alloc_cache(self.offset)
