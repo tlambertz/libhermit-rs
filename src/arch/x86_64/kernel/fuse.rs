@@ -27,6 +27,7 @@ const FUSE_ENOENT_ID: u64 = 0;
 const FUSE_ROOT_ID: u64 = 1;
 const MAX_BUFFER_SIZE: usize = 0x1000 * 256;
 const USE_POLLING: bool = true;
+const ALIGN_BUFFERS_FOR_DIRECT_IO: bool = false;
 
 pub trait FuseInterface: Send + Sync {
 	fn send_recv_buffers_blocking(
@@ -393,7 +394,8 @@ impl<T: FuseInterface> FuseFile<T> {
 			len = self.connection_options.max_bufsize;
 		}
 		if let Some(fh) = self.fuse_fh {
-			let (cmd, rsp) = create_write(self.fuse_nid.unwrap(), fh, &buf[..len], self.offset as u64);
+			let (cmd, rsp) =
+				create_write(self.fuse_nid.unwrap(), fh, &buf[..len], self.offset as u64);
 			let rsp = self.driver.handle_request(cmd, rsp)?;
 			trace!("write response: {:?}", rsp);
 
@@ -771,22 +773,27 @@ pub fn create_write(
 	let rsp = Default::default();
 	let rsphdr = Default::default();
 
-	//direct-io requires aligned memory.
-	// ugly hack from https://stackoverflow.com/questions/60180121/how-do-i-allocate-a-vecu8-that-is-aligned-to-the-size-of-the-cache-line
-	let mut aligned: Vec<AlignToPage> =
-		Vec::with_capacity(buf.len() / ::core::mem::size_of::<AlignToPage>() + 1);
-	let ptr = aligned.as_mut_ptr();
-	let cap_units = aligned.capacity();
-	::core::mem::forget(aligned);
-	let mut writebuf = unsafe {
-		Vec::from_raw_parts(
-			ptr as *mut u8,
-			buf.len(),
-			cap_units * ::core::mem::size_of::<AlignToPage>(),
-		)
+	let writebuf = if ALIGN_BUFFERS_FOR_DIRECT_IO {
+		//direct-io requires aligned memory.
+		// ugly hack from https://stackoverflow.com/questions/60180121/how-do-i-allocate-a-vecu8-that-is-aligned-to-the-size-of-the-cache-line
+		let mut aligned: Vec<AlignToPage> =
+			Vec::with_capacity(buf.len() / ::core::mem::size_of::<AlignToPage>() + 1);
+		let ptr = aligned.as_mut_ptr();
+		let cap_units = aligned.capacity();
+		::core::mem::forget(aligned);
+		let mut writebuf = unsafe {
+			Vec::from_raw_parts(
+				ptr as *mut u8,
+				buf.len(),
+				cap_units * ::core::mem::size_of::<AlignToPage>(),
+			)
+		};
+		writebuf.clone_from_slice(buf);
+		writebuf
+	} else {
+		buf.to_vec()
 	};
-	writebuf.clone_from_slice(buf);
-	// let writebuf = buf.to_vec();
+
 	(
 		Cmd {
 			cmd,
@@ -811,21 +818,27 @@ pub fn create_read(nid: u64, size: u32, offset: u64) -> (Cmd<fuse_read_in>, Rsp<
 	cmdhdr.nodeid = nid;
 	let rsp = Default::default();
 	let rsphdr = Default::default();
-	// direct-io requires aligned memory.
-	// ugly hack from https://stackoverflow.com/questions/60180121/how-do-i-allocate-a-vecu8-that-is-aligned-to-the-size-of-the-cache-line
-	let mut aligned: Vec<AlignToPage> =
-		Vec::with_capacity(size as usize / ::core::mem::size_of::<AlignToPage>() + 1);
-	let ptr = aligned.as_mut_ptr();
-	let cap_units = aligned.capacity();
-	::core::mem::forget(aligned);
-	let readbuf = unsafe {
-		Vec::from_raw_parts(
-			ptr as *mut u8,
-			size as usize,
-			cap_units * ::core::mem::size_of::<AlignToPage>(),
-		)
+
+	let readbuf = if ALIGN_BUFFERS_FOR_DIRECT_IO {
+		// direct-io requires aligned memory.
+		// ugly hack from https://stackoverflow.com/questions/60180121/how-do-i-allocate-a-vecu8-that-is-aligned-to-the-size-of-the-cache-line
+		let mut aligned: Vec<AlignToPage> =
+			Vec::with_capacity(size as usize / ::core::mem::size_of::<AlignToPage>() + 1);
+		let ptr = aligned.as_mut_ptr();
+		let cap_units = aligned.capacity();
+		::core::mem::forget(aligned);
+		let readbuf = unsafe {
+			Vec::from_raw_parts(
+				ptr as *mut u8,
+				size as usize,
+				cap_units * ::core::mem::size_of::<AlignToPage>(),
+			)
+		};
+		readbuf
+	} else {
+		vec![0; size as usize]
 	};
-	// let readbuf = vec![0; size as usize];
+
 	(
 		Cmd {
 			cmd,
