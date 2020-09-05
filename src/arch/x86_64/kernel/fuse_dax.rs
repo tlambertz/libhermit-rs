@@ -96,11 +96,12 @@ impl FuseDaxCache {
 
 		let slab = self.allocator.lock().allocate()?;
 		{
+			let slab = slab.lock();
 			trace!(
 				"Alloc'd slab for offset {} at {:p} [{:x}]",
 				file_offset,
-				slab.lock().addr,
-				slab.lock().moffset
+				slab.addr,
+				slab.moffset
 			);
 		}
 		let entry = CacheEntry {
