@@ -879,6 +879,7 @@ impl<'a> VirtqUsed<'a> {
 		trace!("Waiting with polling until chain {} is used!", target_idx);
 
 		let mut current_generation: u64 = 0;
+		let mut last_index = unsafe { core::ptr::read_volatile(self.idx) };
 
 		// We might need to wait multiple times, so loop
 		loop {
@@ -895,9 +896,14 @@ impl<'a> VirtqUsed<'a> {
 			}
 
 			// Check queue for updates
-			let found = self.check_queue(Some(target_idx));
-			if found {
-				break;
+			let current_index = unsafe { core::ptr::read_volatile(self.idx) };
+			if last_index != current_index {
+				// We have seen an update! Check the queue if it is for us
+				last_index = current_index;
+				let found = self.check_queue(Some(target_idx));
+				if found {
+					break;
+				}
 			}
 		}
 
