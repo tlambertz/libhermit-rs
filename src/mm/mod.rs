@@ -125,7 +125,7 @@ pub fn init() {
 
 		info!("Kernel heap size: {} MB", size >> 20);
 		let user_heap_size = align_down!(
-			total_memory_size() - kernel_end_address() - reserved_space - 3 * LargePageSize::SIZE,
+			total_memory_size() - kernel_end_address() - reserved_space - size,
 			LargePageSize::SIZE
 		);
 		info!("User-space heap size: {} MB", user_heap_size >> 20);
