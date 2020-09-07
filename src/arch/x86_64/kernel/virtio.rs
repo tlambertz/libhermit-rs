@@ -881,6 +881,12 @@ impl<'a> VirtqUsed<'a> {
 		let mut current_generation: u64 = 0;
 		let mut last_index = unsafe { core::ptr::read_volatile(self.idx) };
 
+		// Fast-path: element is there, we are first to check
+		let found = self.check_queue(Some(target_idx));
+		if found {
+			return;
+		}
+
 		// We might need to wait multiple times, so loop
 		loop {
 			// To avoid constantly locking the skip indice list, just check its generation
@@ -899,6 +905,7 @@ impl<'a> VirtqUsed<'a> {
 			let current_index = unsafe { core::ptr::read_volatile(self.idx) };
 			if last_index != current_index {
 				// We have seen an update! Check the queue if it is for us
+				trace!("Seen queue update! checking for {}", target_idx);
 				last_index = current_index;
 				let found = self.check_queue(Some(target_idx));
 				if found {
