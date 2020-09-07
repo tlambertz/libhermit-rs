@@ -27,7 +27,14 @@ const FUSE_ENOENT_ID: u64 = 0;
 const FUSE_ROOT_ID: u64 = 1;
 const MAX_BUFFER_SIZE: usize = 0x1000 * 256;
 const USE_POLLING: bool = true;
+
+// Should all read and write buffers be aligned to a page before handed off to fuse?
+// This DISABLES zero-copy obviously, so will have a big performance impact!
 const ALIGN_BUFFERS_FOR_DIRECT_IO: bool = false;
+
+// Needed alignment for DIRECT_IO
+#[repr(C, align(4096))]
+struct AlignToPage([u8; 4096]);
 
 pub trait FuseInterface: Send + Sync {
 	fn send_recv_buffers_blocking(
@@ -47,7 +54,11 @@ impl<T: FuseInterface> FuseDriver<T> {
 	/// Since responses can have different sizes, they are preallcoated by the caller.
 	/// Ownership is passed, and returned when the request is completed.
 	/// This call is blocking and only returns once the reply is available.
-	pub fn handle_request<S, R>(&self, cmd: Cmd<S>, mut rsp: Rsp<R>) -> Result<Rsp<R>, FileError>
+	pub fn handle_request<'a, 'b, S, R>(
+		&self,
+		cmd: Cmd<'a, S>,
+		mut rsp: Rsp<'b, R>,
+	) -> Result<Rsp<'b, R>, FileError>
 	where
 		S: FuseIn + core::fmt::Debug,
 		R: FuseOut + core::fmt::Debug,
@@ -57,7 +68,6 @@ impl<T: FuseInterface> FuseDriver<T> {
 		// Convert buffers to raw u8 slices so the backend can handle them.
 		let to_host = cmd.as_u8bufs();
 		let from_host = rsp.as_u8bufs_mut();
-
 		// Send the buffers
 		self.0
 			.send_recv_buffers_blocking(&to_host, &from_host, USE_POLLING)
@@ -170,7 +180,7 @@ impl<T: FuseInterface + 'static> PosixFileSystem for Fuse<T> {
 		let rsp: Rsp<fuse_unlink_out> = Rsp {
 			rsp: Default::default(),
 			header: Default::default(),
-			extra_buffer: FuseData(None),
+			extra_buffer: FuseDataMut(None),
 		};
 
 		let rsp = self.driver.handle_request(cmd, rsp)?;
@@ -287,7 +297,7 @@ impl<T: FuseInterface + 'static> Fuse<T> {
 		let rsp: Rsp<fuse_entry_out> = Rsp {
 			rsp: Default::default(),
 			header: Default::default(),
-			extra_buffer: FuseData(None),
+			extra_buffer: FuseDataMut(None),
 		};
 		let rsp = self.driver.handle_request(cmd, rsp)?;
 		trace!("result: {:?}", rsp);
@@ -313,22 +323,48 @@ struct FuseFile<T: FuseInterface> {
 
 impl<T: FuseInterface> FuseFile<T> {
 	/// Reads the file using normal fuse read commands. File contents are in fuse reply
-	fn read_fuse(&mut self, buf: &mut [u8]) -> Result<Vec<u8>, FileError> {
+	fn read_fuse(&mut self, buf: &mut [u8]) -> Result<usize, FileError> {
 		let mut len = buf.len();
 		if len > self.connection_options.max_bufsize {
 			debug!("Reading longer than max_read_len: {}", len);
 			len = self.connection_options.max_bufsize;
 		}
 		if let Some(fh) = self.fuse_fh {
-			let (cmd, rsp) = create_read(fh, len as u32, self.offset as u64);
-			let rsp = self.driver.handle_request(cmd, rsp)?;
-			let len = rsp.header.len as usize - ::core::mem::size_of::<fuse_out_header>();
+			let read_bytes = if ALIGN_BUFFERS_FOR_DIRECT_IO {
+				// direct-io requires aligned memory.
+				// ugly hack from https://stackoverflow.com/questions/60180121/how-do-i-allocate-a-vecu8-that-is-aligned-to-the-size-of-the-cache-line
+				let mut aligned: Vec<AlignToPage> =
+					Vec::with_capacity(len as usize / ::core::mem::size_of::<AlignToPage>() + 1);
+				let ptr = aligned.as_mut_ptr();
+				let cap_units = aligned.capacity();
+				::core::mem::forget(aligned);
+				let mut readbuf = unsafe {
+					Vec::from_raw_parts(
+						ptr as *mut u8,
+						len as usize,
+						cap_units * ::core::mem::size_of::<AlignToPage>(),
+					)
+				};
+				let (cmd, rsp) = create_read(fh, len as u32, self.offset as u64, &mut readbuf);
+				let rsp = self.driver.handle_request(cmd, rsp)?;
+				let read_bytes =
+					rsp.header.len as usize - ::core::mem::size_of::<fuse_out_header>();
+				buf[..read_bytes].copy_from_slice(&readbuf);
+				read_bytes
+			} else {
+				// Zerocopy!
+				trace!("Zero copy fuse read!");
+				let (cmd, rsp) = create_read(fh, len as u32, self.offset as u64, buf);
+				let rsp = self.driver.handle_request(cmd, rsp)?;
+				rsp.header.len as usize - ::core::mem::size_of::<fuse_out_header>()
+			};
+			assert!(read_bytes <= buf.len());
+
 			self.offset += len;
-			// TODO: do this zerocopy
-			let mut vec = rsp.extra_buffer.0.unwrap();
-			vec.truncate(len);
-			trace!("LEN: {}, VEC: {:?}", len, vec);
-			Ok(vec)
+
+			trace!("LEN: {}, BUF: {:?}", len, buf);
+
+			Ok(read_bytes)
 		} else {
 			warn!("File not open, cannot read!");
 			Err(FileError::ENOENT)
@@ -338,7 +374,6 @@ impl<T: FuseInterface> FuseFile<T> {
 	/// Uses fuse setupmapping to create a DAX mapping, and copies from that. Mappings are cached
 	fn read_dax(&mut self, buf: &mut [u8]) -> Result<usize, FileError> {
 		trace!("read_dax({:x}) from offset {:x}", buf.len(), self.offset);
-
 
 		// Limit length to file size
 		let mut len = buf.len();
@@ -401,10 +436,61 @@ impl<T: FuseInterface> FuseFile<T> {
 			);
 			len = self.connection_options.max_bufsize;
 		}
+		let buf = &buf[..len];
+
 		if let Some(fh) = self.fuse_fh {
-			let (cmd, rsp) =
-				create_write(self.fuse_nid.unwrap(), fh, &buf[..len], self.offset as u64);
-			let rsp = self.driver.handle_request(cmd, rsp)?;
+			let cmd = fuse_write_in {
+				fh,
+				offset: self.offset as u64,
+				size: buf.len() as u32,
+				..Default::default()
+			};
+			let mut cmdhdr = create_in_header::<fuse_write_in>(Opcode::FUSE_WRITE);
+			cmdhdr.nodeid = self.fuse_nid.unwrap();
+			let rsp = Default::default();
+			let rsphdr = Default::default();
+
+			let rsp: Rsp<fuse_write_out> = Rsp {
+				rsp,
+				header: rsphdr,
+				extra_buffer: FuseDataMut(None),
+			};
+
+			let rsp = if ALIGN_BUFFERS_FOR_DIRECT_IO {
+				// direct-io requires aligned memory.
+				// ugly hack from https://stackoverflow.com/questions/60180121/how-do-i-allocate-a-vecu8-that-is-aligned-to-the-size-of-the-cache-line
+				let mut aligned: Vec<AlignToPage> =
+					Vec::with_capacity(buf.len() / ::core::mem::size_of::<AlignToPage>() + 1);
+				let ptr = aligned.as_mut_ptr();
+				let cap_units = aligned.capacity();
+				::core::mem::forget(aligned);
+				let mut writebuf = unsafe {
+					Vec::from_raw_parts(
+						ptr as *mut u8,
+						buf.len(),
+						cap_units * ::core::mem::size_of::<AlignToPage>(),
+					)
+				};
+				writebuf.clone_from_slice(buf);
+				let cmd = Cmd {
+					cmd,
+					header: cmdhdr,
+					extra_buffer: FuseData(Some(writebuf.as_ref())),
+				};
+
+				self.driver.handle_request(cmd, rsp)?
+			} else {
+				// Zero copy
+				trace!("Zero copy fuse write!");
+				let cmd = Cmd {
+					cmd,
+					header: cmdhdr,
+					extra_buffer: FuseData(Some(buf)),
+				};
+
+				self.driver.handle_request(cmd, rsp)?
+			};
+
 			trace!("write response: {:?}", rsp);
 
 			let len = rsp.rsp.size as usize;
@@ -454,14 +540,14 @@ impl<T: FuseInterface> FuseFile<T> {
 		while currently_written < len {
 			let mut cached = self.get_cached()?.clone();
 			let cached = cached.as_buf(self.offset);
-			
+
 			let mut to_write = len - currently_written;
-			
+
 			// Limit write length to buffer boundary
 			if cached.len() < to_write {
 				to_write = cached.len();
 			}
-	
+
 			// Write buffer into cache.
 			trace!(
 				"copying data to slice! from {:p} to {:p} of len {:x}",
@@ -469,11 +555,15 @@ impl<T: FuseInterface> FuseFile<T> {
 				cached.as_ptr(),
 				to_write
 			);
-	
+
 			// Use non-prefetching memcpy implementation
 			//cached[..to_write].copy_from_slice(&buf[currently_written..currently_written+to_write]);
 			unsafe {
-				memcpy_noprefetch(cached.as_mut_ptr(), buf[currently_written..].as_ptr(), to_write);
+				memcpy_noprefetch(
+					cached.as_mut_ptr(),
+					buf[currently_written..].as_ptr(),
+					to_write,
+				);
 			}
 
 			self.offset += to_write;
@@ -552,7 +642,7 @@ impl<T: FuseInterface> FuseFile<T> {
 			Rsp {
 				rsp,
 				header: rsphdr,
-				extra_buffer: FuseData(None),
+				extra_buffer: FuseDataMut(None),
 			},
 		)?;
 
@@ -599,7 +689,6 @@ impl<T: FuseInterface> FuseFile<T> {
 		let byte_ptr = mappings.as_ptr() as *const u8;
 		let byte_len = mappings.len() * core::mem::size_of::<fuse_removemapping_one>();
 		let byte_arr = unsafe { core::slice::from_raw_parts(byte_ptr, byte_len) };
-		let extra = Vec::from(byte_arr);
 		let rsphdr = Default::default();
 
 		if self
@@ -608,12 +697,12 @@ impl<T: FuseInterface> FuseFile<T> {
 				Cmd {
 					cmd,
 					header: cmdhdr,
-					extra_buffer: FuseData(Some(extra)),
+					extra_buffer: FuseData(Some(byte_arr)),
 				},
 				Rsp {
 					rsp,
 					header: rsphdr,
-					extra_buffer: FuseData(None),
+					extra_buffer: FuseDataMut(None),
 				},
 			)
 			.is_err()
@@ -626,7 +715,24 @@ impl<T: FuseInterface> FuseFile<T> {
 impl<T: FuseInterface> PosixFile for FuseFile<T> {
 	fn close(&mut self) -> Result<(), FileError> {
 		self.drop_cache();
-		let (cmd, rsp) = create_release(self.fuse_nid.unwrap(), self.fuse_fh.unwrap());
+
+		let mut cmd: fuse_release_in = Default::default();
+		let mut cmdhdr = create_in_header::<fuse_release_in>(Opcode::FUSE_RELEASE);
+		cmdhdr.nodeid = self.fuse_nid.unwrap();
+		cmd.fh = self.fuse_fh.unwrap();
+		let rsp = Default::default();
+		let rsphdr = Default::default();
+		let cmd = Cmd {
+			cmd,
+			header: cmdhdr,
+			extra_buffer: FuseData(None),
+		};
+		let rsp: Rsp<fuse_release_out> = Rsp {
+			rsp,
+			header: rsphdr,
+			extra_buffer: FuseDataMut(None),
+		};
+
 		self.driver.handle_request(cmd, rsp)?;
 
 		Ok(())
@@ -636,10 +742,7 @@ impl<T: FuseInterface> PosixFile for FuseFile<T> {
 		if self.dax_cache.is_some() {
 			self.read_dax(buf)
 		} else {
-			let read = self.read_fuse(buf)?;
-			let read_bytes = read.len();
-			buf[..read_bytes].copy_from_slice(&read);
-			Ok(read_bytes)
+			self.read_fuse(buf)
 		}
 	}
 
@@ -689,7 +792,7 @@ impl<T: FuseInterface> PosixFile for FuseFile<T> {
 			Rsp {
 				rsp,
 				header: rsphdr,
-				extra_buffer: FuseData(None),
+				extra_buffer: FuseDataMut(None),
 			},
 		)?;
 
@@ -717,33 +820,15 @@ pub fn create_create(
 		Rsp {
 			rsp,
 			header: rsphdr,
-			extra_buffer: FuseData(None),
+			extra_buffer: FuseDataMut(None),
 		},
 	)
 }
 
-pub fn create_release(nid: u64, fh: u64) -> (Cmd<fuse_release_in>, Rsp<fuse_release_out>) {
-	let mut cmd: fuse_release_in = Default::default();
-	let mut cmdhdr = create_in_header::<fuse_release_in>(Opcode::FUSE_RELEASE);
-	cmdhdr.nodeid = nid;
-	cmd.fh = fh;
-	let rsp = Default::default();
-	let rsphdr = Default::default();
-	(
-		Cmd {
-			cmd,
-			header: cmdhdr,
-			extra_buffer: FuseData(None),
-		},
-		Rsp {
-			rsp,
-			header: rsphdr,
-			extra_buffer: FuseData(None),
-		},
-	)
-}
-
-pub fn create_open(nid: u64, flags: u32) -> (Cmd<fuse_open_in>, Rsp<fuse_open_out>) {
+pub fn create_open(
+	nid: u64,
+	flags: u32,
+) -> (Cmd<'static, fuse_open_in>, Rsp<'static, fuse_open_out>) {
 	let cmd = fuse_open_in {
 		flags,
 		..Default::default()
@@ -761,69 +846,17 @@ pub fn create_open(nid: u64, flags: u32) -> (Cmd<fuse_open_in>, Rsp<fuse_open_ou
 		Rsp {
 			rsp,
 			header: rsphdr,
-			extra_buffer: FuseData(None),
+			extra_buffer: FuseDataMut(None),
 		},
 	)
 }
 
-#[repr(C, align(4096))]
-struct AlignToPage([u8; 4096]);
-// TODO: do write zerocopy? currently does buf.to_vec()
-// problem: i cannot create owned type, since this would deallocate memory on drop. But memory belongs to userspace!
-//          Using references, i have to be careful of lifetimes!
-pub fn create_write(
+pub fn create_read(
 	nid: u64,
-	fh: u64,
-	buf: &[u8],
+	size: u32,
 	offset: u64,
-) -> (Cmd<fuse_write_in>, Rsp<fuse_write_out>) {
-	let cmd = fuse_write_in {
-		fh: fh,
-		offset,
-		size: buf.len() as u32,
-		..Default::default()
-	};
-	let mut cmdhdr = create_in_header::<fuse_write_in>(Opcode::FUSE_WRITE);
-	cmdhdr.nodeid = nid;
-	let rsp = Default::default();
-	let rsphdr = Default::default();
-
-	let writebuf = if ALIGN_BUFFERS_FOR_DIRECT_IO {
-		//direct-io requires aligned memory.
-		// ugly hack from https://stackoverflow.com/questions/60180121/how-do-i-allocate-a-vecu8-that-is-aligned-to-the-size-of-the-cache-line
-		let mut aligned: Vec<AlignToPage> =
-			Vec::with_capacity(buf.len() / ::core::mem::size_of::<AlignToPage>() + 1);
-		let ptr = aligned.as_mut_ptr();
-		let cap_units = aligned.capacity();
-		::core::mem::forget(aligned);
-		let mut writebuf = unsafe {
-			Vec::from_raw_parts(
-				ptr as *mut u8,
-				buf.len(),
-				cap_units * ::core::mem::size_of::<AlignToPage>(),
-			)
-		};
-		writebuf.clone_from_slice(buf);
-		writebuf
-	} else {
-		buf.to_vec()
-	};
-
-	(
-		Cmd {
-			cmd,
-			header: cmdhdr,
-			extra_buffer: FuseData(Some(writebuf)),
-		},
-		Rsp {
-			rsp,
-			header: rsphdr,
-			extra_buffer: FuseData(None),
-		},
-	)
-}
-
-pub fn create_read(nid: u64, size: u32, offset: u64) -> (Cmd<fuse_read_in>, Rsp<fuse_read_out>) {
+	readbuf: &mut [u8],
+) -> (Cmd<fuse_read_in>, Rsp<fuse_read_out>) {
 	let cmd = fuse_read_in {
 		offset,
 		size,
@@ -834,26 +867,6 @@ pub fn create_read(nid: u64, size: u32, offset: u64) -> (Cmd<fuse_read_in>, Rsp<
 	let rsp = Default::default();
 	let rsphdr = Default::default();
 
-	let readbuf = if ALIGN_BUFFERS_FOR_DIRECT_IO {
-		// direct-io requires aligned memory.
-		// ugly hack from https://stackoverflow.com/questions/60180121/how-do-i-allocate-a-vecu8-that-is-aligned-to-the-size-of-the-cache-line
-		let mut aligned: Vec<AlignToPage> =
-			Vec::with_capacity(size as usize / ::core::mem::size_of::<AlignToPage>() + 1);
-		let ptr = aligned.as_mut_ptr();
-		let cap_units = aligned.capacity();
-		::core::mem::forget(aligned);
-		let readbuf = unsafe {
-			Vec::from_raw_parts(
-				ptr as *mut u8,
-				size as usize,
-				cap_units * ::core::mem::size_of::<AlignToPage>(),
-			)
-		};
-		readbuf
-	} else {
-		vec![0; size as usize]
-	};
-
 	(
 		Cmd {
 			cmd,
@@ -863,7 +876,7 @@ pub fn create_read(nid: u64, size: u32, offset: u64) -> (Cmd<fuse_read_in>, Rsp<
 		Rsp {
 			rsp,
 			header: rsphdr,
-			extra_buffer: FuseData(Some(readbuf)),
+			extra_buffer: FuseDataMut(Some(readbuf)),
 		},
 	)
 }
@@ -884,7 +897,7 @@ where
 	}
 }
 
-pub fn create_init() -> (Cmd<fuse_init_in>, Rsp<fuse_init_out>) {
+pub fn create_init() -> (Cmd<'static, fuse_init_in>, Rsp<'static, fuse_init_out>) {
 	let cmd = fuse_init_in {
 		major: 7,
 		minor: 31,
@@ -903,7 +916,7 @@ pub fn create_init() -> (Cmd<fuse_init_in>, Rsp<fuse_init_out>) {
 		Rsp {
 			rsp,
 			header: rsphdr,
-			extra_buffer: FuseData(None),
+			extra_buffer: FuseDataMut(None),
 		},
 	)
 }

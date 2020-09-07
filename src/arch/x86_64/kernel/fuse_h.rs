@@ -79,10 +79,11 @@ pub unsafe trait FuseIn {}
 pub unsafe trait FuseOut {}
 
 /// Stores read/write buffers
-pub struct FuseData(pub Option<Vec<u8>>);
+pub struct FuseData<'a>(pub Option<&'a [u8]>);
+pub struct FuseDataMut<'a>(pub Option<&'a mut [u8]>);
 
 /// Print a maximum of 16 hex-chars for each buffer!
-impl fmt::Debug for FuseData {
+impl<'a> fmt::Debug for FuseData<'a> {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		if let Some(buf) = &self.0 {
 			if buf.len() <= 16 {
@@ -101,25 +102,44 @@ impl fmt::Debug for FuseData {
 		}
 	}
 }
-
-#[repr(C)]
-#[derive(Debug)]
-pub struct Cmd<T: FuseIn + core::fmt::Debug> {
-	pub header: fuse_in_header,
-	pub cmd: T,
-	pub extra_buffer: FuseData, // eg for writes. allows zero-copy and avoids rust size_of operations (which always add alignment padding)
+impl<'a> fmt::Debug for FuseDataMut<'a> {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		if let Some(buf) = &self.0 {
+			if buf.len() <= 16 {
+				write!(f, "{:x?}", buf)
+			} else {
+				// We are longer than 16 chars, truncate!
+				write!(
+					f,
+					"{:x?} (mutable, truncated from {:#x} bytes)",
+					&buf[..16],
+					buf.len()
+				)
+			}
+		} else {
+			write!(f, "None")
+		}
+	}
 }
 
 #[repr(C)]
 #[derive(Debug)]
-pub struct Rsp<T: FuseOut + core::fmt::Debug> {
+pub struct Cmd<'a, T: FuseIn + core::fmt::Debug> {
+	pub header: fuse_in_header,
+	pub cmd: T,
+	pub extra_buffer: FuseData<'a>, // eg for writes. allows zero-copy and avoids rust size_of operations (which always add alignment padding)
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct Rsp<'a, T: FuseOut + core::fmt::Debug> {
 	pub header: fuse_out_header,
 	pub rsp: T,
-	pub extra_buffer: FuseData, // eg for reads. allows zero-copy and avoids rust size_of operations (which always add alignment padding)
+	pub extra_buffer: FuseDataMut<'a>, // eg for reads. allows zero-copy and avoids rust size_of operations (which always add alignment padding)
 }
 
 // TODO: use from/into? But these require consuming the command, so we need some better memory model to avoid deallocation
-impl<T> Cmd<T>
+impl<'a, T> Cmd<'a, T>
 where
 	T: FuseIn + core::fmt::Debug,
 {
@@ -140,14 +160,14 @@ where
 		};
 		//info!("{:#?}, {:#?}", rawheader, rawcmd);
 		if let Some(extra) = &self.extra_buffer.0 {
-			vec![rawheader, rawcmd, &extra.as_ref()]
+			vec![rawheader, rawcmd, *extra]
 		} else {
 			vec![rawheader, rawcmd]
 		}
 	}
 }
 
-impl<T> Rsp<T>
+impl<'a, T> Rsp<'a, T>
 where
 	T: FuseOut + core::fmt::Debug,
 {
@@ -160,8 +180,8 @@ where
 				::core::mem::size_of::<T>() + ::core::mem::size_of::<fuse_out_header>(),
 			)
 		};
-		if let Some(extra) = self.extra_buffer.0.as_mut() {
-			vec![rawrsp, extra]
+		if let Some(extra) = &mut self.extra_buffer.0 {
+			vec![rawrsp, *extra]
 		} else {
 			vec![rawrsp]
 		}
