@@ -58,7 +58,7 @@ struct InnerConfig<'a> {
 
 pub struct VirtioFsDriver<'a> {
 	config: Mutex<InnerConfig<'a>>,
-	vqueues: Arc<Vec<Virtq<'a>>>,
+	vqueues: Vec<Virtq<'a>>,
 }
 
 impl<'a> fmt::Debug for VirtioFsDriver<'a> {
@@ -190,7 +190,7 @@ impl<'a> VirtioFsDriver<'a> {
 	pub fn handle_interrupt(&self) -> bool {
 		trace!("Got virtio-fs interrupt!");
 
-		// Spec: The driver MUST handle spurious notifications from the device. 
+		// Spec: The driver MUST handle spurious notifications from the device.
 		// queues check_interrupt is robust to this
 
 		if let Some(queue) = self.vqueues.get(1) {
@@ -357,7 +357,7 @@ pub fn create_virtiofs_driver(
 	// Instanciate driver on heap, so it outlives this function
 	let drv = VirtioFsDriver {
 		config: Mutex::new(config),
-		vqueues: Arc::new(vqueues),
+		vqueues,
 	};
 	unsafe {
 		ISR_CFG = Some(isr_cfg);
