@@ -1,0 +1,3 @@
+(function() {var implementors = {};
+implementors["num_iter"] = [{"text":"impl&lt;A&gt; DoubleEndedIterator for Range&lt;A&gt; <span class=\"where fmt-newline\">where<br>&nbsp;&nbsp;&nbsp;&nbsp;A: Integer + Clone + ToPrimitive,&nbsp;</span>","synthetic":false,"types":[]},{"text":"impl&lt;A&gt; DoubleEndedIterator for RangeInclusive&lt;A&gt; <span class=\"where fmt-newline\">where<br>&nbsp;&nbsp;&nbsp;&nbsp;A: Sub&lt;A, Output = A&gt; + Integer + Clone + ToPrimitive,&nbsp;</span>","synthetic":false,"types":[]}];
+if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()

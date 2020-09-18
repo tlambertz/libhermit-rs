@@ -1,0 +1,3 @@
+(function() {var implementors = {};
+implementors["hermit"] = [{"text":"impl&lt;'a&gt; Drop for AcpiTable&lt;'a&gt;","synthetic":false,"types":[]},{"text":"impl Drop for TaskStacks","synthetic":false,"types":[]},{"text":"impl Drop for TaskTLS","synthetic":false,"types":[]},{"text":"impl Drop for virtq_desc_raw","synthetic":false,"types":[]}];
+if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()
