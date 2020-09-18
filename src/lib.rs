@@ -33,6 +33,7 @@
 #![feature(linkage)]
 #![feature(linked_list_cursors)]
 #![feature(llvm_asm)]
+#![feature(asm)]
 #![feature(panic_info_message)]
 #![feature(specialization)]
 #![feature(nonnull_slice_from_raw_parts)]
@@ -47,6 +48,8 @@
 	cfg_attr(test, reexport_test_harness_main = "test_main")
 )]
 #![cfg_attr(target_os = "hermit", cfg_attr(test, no_main))]
+// for memcpy() only
+#![feature(naked_functions)]
 
 // EXTERNAL CRATES
 #[macro_use]
