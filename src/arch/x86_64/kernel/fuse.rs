@@ -362,7 +362,11 @@ impl<T: FuseInterface> FuseFile<T> {
 
 			self.offset += len;
 
-			trace!("LEN: {}, BUF: {:?}", len, buf);
+			if buf.len() > 16 {
+				trace!("LEN: {}, BUF: {:?} ...", len, &buf[0..16]);
+			} else {
+				trace!("LEN: {}, BUF: {:?}", len, buf);
+			}
 
 			Ok(read_bytes)
 		} else {
