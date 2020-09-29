@@ -276,7 +276,7 @@ impl<'a> VirtioNetDriver<'a> {
 			for i in 0..vqsize {
 				let buffer = RxBuffer::new(buffer_size);
 				let addr = buffer.addr;
-				vqueues[VIRTIO_NET_RX_QUEUE].add_buffer(i, addr, buffer_size, VIRTQ_DESC_F_WRITE);
+				vqueues[VIRTIO_NET_RX_QUEUE].add_buffer(i, addr.as_u64(), buffer_size, VIRTQ_DESC_F_WRITE);
 				vec_buffer.push(buffer);
 			}
 		}
@@ -287,7 +287,7 @@ impl<'a> VirtioNetDriver<'a> {
 			for i in 0..vqsize {
 				let buffer = TxBuffer::new(buffer_size);
 				let addr = buffer.addr;
-				vqueues[VIRTIO_NET_TX_QUEUE].add_buffer(i, addr, buffer_size, VIRTQ_DESC_F_DEFAULT);
+				vqueues[VIRTIO_NET_TX_QUEUE].add_buffer(i, addr.as_u64(), buffer_size, VIRTQ_DESC_F_DEFAULT);
 				vec_buffer.push(buffer);
 			}
 		}
@@ -383,7 +383,7 @@ impl<'a> VirtioNetDriver<'a> {
 	}
 
 	pub fn set_polling_mode(&mut self, value: bool) {
-		(self.vqueues.as_deref_mut().unwrap())[VIRTIO_NET_RX_QUEUE].set_polling_mode(value);
+		//(self.vqueues.as_deref_mut().unwrap())[VIRTIO_NET_RX_QUEUE].set_polling_mode(value);
 	}
 
 	pub fn get_mac_address(&self) -> [u8; 6] {

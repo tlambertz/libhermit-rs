@@ -5,7 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. This file may not be
 // copied, modified, or distributed except according to those terms.
 
-use crate::arch::x86_64::kernel::apic;
+use crate::{arch::x86_64::kernel::apic, synch::spinlock::SpinlockIrqSave};
 use crate::arch::x86_64::kernel::irq::*;
 use crate::arch::x86_64::kernel::pci::{
 	self, get_network_driver, PciAdapter, PciClassCode, PciDriver, PciNetworkControllerSubclass,
@@ -13,6 +13,7 @@ use crate::arch::x86_64::kernel::pci::{
 use crate::arch::x86_64::kernel::percore::{core_scheduler, increment_irq_counter};
 use crate::arch::x86_64::kernel::virtio_fs;
 use crate::arch::x86_64::kernel::virtio_net;
+use crate::arch::mm::VirtAddr;
 
 use crate::arch::x86_64::mm::paging;
 use crate::config::VIRTIO_MAX_QUEUE_SIZE;
@@ -54,6 +55,7 @@ pub mod consts {
 	pub const VIRTIO_F_NOTIFICATION_DATA: u64 = 1 << 38;
 
 	// Descriptor flags
+	pub const VIRTQ_DESC_F_DEFAULT: u16 = 0;
 	pub const VIRTQ_DESC_F_NEXT: u16 = 1; // Buffer continues via next field
 	pub const VIRTQ_DESC_F_WRITE: u16 = 2; // Buffer is device write-only (instead of read-only)
 	pub const VIRTQ_DESC_F_INDIRECT: u16 = 4; // Buffer contains list of virtq_desc
@@ -178,9 +180,9 @@ impl<'a> Virtq<'a> {
 		// Tell device about the guest-physical addresses of our queue structs:
 		// TODO: cleanup pointer conversions (use &mut vq....?)
 		common_cfg.queue_select = index;
-		common_cfg.queue_desc = paging::virt_to_phys(desc_table.as_ptr() as usize) as u64;
-		common_cfg.queue_avail = paging::virt_to_phys(avail_flags as *mut _ as usize) as u64;
-		common_cfg.queue_used = paging::virt_to_phys(used_flags as *const _ as usize) as u64;
+		common_cfg.queue_desc = paging::virt_to_phys( VirtAddr::from_usize(desc_table.as_ptr() as usize)).as_u64();
+		common_cfg.queue_avail = paging::virt_to_phys(VirtAddr::from_usize(avail_flags as *mut _ as usize)).as_u64();
+		common_cfg.queue_used = paging::virt_to_phys(VirtAddr::from_usize(used_flags as *const _ as usize)).as_u64();
 		common_cfg.queue_enable = 1;
 
 		debug!(
@@ -322,7 +324,7 @@ impl<'a> Virtq<'a> {
 			let req = &mut chain.0.last_mut().unwrap().raw;
 
 			// 2. Set d.addr to the physical address of the start of b
-			req.addr = paging::virt_to_phys(dat.as_ptr() as usize) as u64;
+			req.addr = paging::virt_to_phys(VirtAddr::from_usize(dat.as_ptr() as usize)).as_u64();
 
 			// 3. Set d.len to the length of b.
 			req.len = dat.len() as u32; // TODO: better cast?
@@ -342,7 +344,7 @@ impl<'a> Virtq<'a> {
 			for dat in rsp_buf {
 				self.virtq_desc.extend(&mut chain);
 				let rsp = &mut chain.0.last_mut().unwrap().raw;
-				rsp.addr = paging::virt_to_phys(dat.as_ptr() as usize) as u64;
+				rsp.addr = paging::virt_to_phys(VirtAddr::from(dat.as_ptr() as usize)).as_u64();
 				rsp.len = dat.len() as u32; // TODO: better cast?
 				rsp.flags = VIRTQ_DESC_F_WRITE;
 				trace!("written in descriptor: {:?} @ {:p}", rsp, rsp);
@@ -405,7 +407,7 @@ impl<'a> Virtq<'a> {
 		let mut chain = chainrc.lock();
 		self.virtq_desc.extend(&mut chain);
 		let rsp = &mut chain.0.last_mut().unwrap().raw;
-		rsp.addr = paging::virt_to_phys(addr as usize) as u64;
+		rsp.addr = paging::virt_to_phys(VirtAddr::from(addr as usize)).as_u64();
 		rsp.len = len.try_into().unwrap();
 		rsp.flags = flags;
 
@@ -1158,7 +1160,7 @@ pub fn map_cap(
 	adapter: &pci::PciAdapter,
 	cap: &pci::PciCapability,
 	no_cache: bool,
-) -> Result<(usize, usize), ()> {
+) -> Result<(VirtAddr, usize), ()> {
 	// TODO: assert this cap is virtiocap?
 	// TODO: cleanup 'hacky' type conversions
 
@@ -1191,7 +1193,7 @@ pub fn get_shm_config(adapter: &PciAdapter, shm_id: u8) -> Result<VirtioSharedMe
 	let (addr, len) = map_cap(adapter, &cap, false)?;
 
 	Ok(VirtioSharedMemory {
-		addr: addr as *mut usize,
+		addr: addr.as_u64() as *mut usize,
 		len: len as u64,
 	})
 }
@@ -1202,7 +1204,7 @@ pub fn get_notify_config(adapter: &pci::PciAdapter) -> Result<VirtioNotification
 
 	let notify_off_multiplier: u32 = cap.read_offset(16); // get offset_of!(virtio_pci_notify_cap, notify_off_multiplier)
 	let notify_cfg = VirtioNotification {
-		notification_ptr: addr as *mut u16,
+		notification_ptr: addr.as_u64() as *mut u16,
 		notify_off_multiplier,
 	};
 	Ok(notify_cfg)
@@ -1214,7 +1216,7 @@ pub fn get_common_config(
 	let cap = find_virtiocap(adapter, VIRTIO_PCI_CAP_COMMON_CFG, None)?;
 	let (addr, _length) = map_cap(adapter, &cap, true)?;
 
-	let cfg = unsafe { &mut *(addr as *mut virtio_pci_common_cfg) };
+	let cfg = unsafe { &mut *(addr.as_u64() as *mut virtio_pci_common_cfg) };
 	Ok(cfg)
 }
 
@@ -1222,7 +1224,7 @@ pub fn get_isr_config(adapter: &PciAdapter) -> Result<&'static mut VirtioISRConf
 	let cap = find_virtiocap(adapter, VIRTIO_PCI_CAP_ISR_CFG, None)?;
 	let (addr, len) = map_cap(adapter, &cap, false)?;
 	assert!(len >= 1);
-	unsafe { Ok(&mut *(addr as *mut VirtioISRConfig)) }
+	unsafe { Ok(&mut *(addr.as_u64() as *mut VirtioISRConfig)) }
 }
 
 /// Scans pci-capabilities for a virtio-capability of type virtiocaptype.
@@ -1287,7 +1289,7 @@ pub fn init_virtio_device(adapter: &pci::PciAdapter) {
 						PciNetworkControllerSubclass::EthernetController => {
 							// TODO: proper error handling on driver creation fail
 							let drv = virtio_net::create_virtionet_driver(adapter).unwrap();
-							pci::register_driver(PciDriver::VirtioNet(drv));
+							pci::register_driver(PciDriver::VirtioNet(SpinlockIrqSave::new(drv)));
 
 							// Install net-specific interrupt handler
 							unsafe {
@@ -1333,7 +1335,7 @@ extern "x86-interrupt" fn virtio_irqhandler(_stack_frame: &mut ExceptionStackFra
 	increment_irq_counter((32 + unsafe { VIRTIO_NET_IRQ_NO }).into());
 
 	let check_scheduler = match get_network_driver() {
-		Some(driver) => driver.borrow_mut().handle_interrupt(),
+		Some(driver) => driver.lock().handle_interrupt(),
 		_ => false,
 	};
 
