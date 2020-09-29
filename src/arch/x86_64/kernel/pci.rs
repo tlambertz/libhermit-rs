@@ -513,7 +513,7 @@ impl PciAdapter {
 				assert!(len - table_offset >= table_size * 4 * 4); // Each table entry is 4x32bit
 				let mut table = unsafe {
 					core::slice::from_raw_parts_mut(
-						(addr + table_offset) as *mut MsixTableEntry,
+						(addr.as_usize() + table_offset) as *mut MsixTableEntry,
 						table_size,
 					)
 				};
