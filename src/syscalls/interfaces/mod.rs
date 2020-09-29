@@ -167,7 +167,7 @@ pub trait SyscallInterface: Send + Sync {
 		let _lock = DRIVER_LOCK.lock();
 
 		match arch::kernel::pci::get_network_driver() {
-			Some(driver) => Ok(driver.borrow().get_mac_address()),
+			Some(driver) => Ok(driver.lock().get_mac_address()),
 			_ => Err(()),
 		}
 	}
@@ -176,7 +176,7 @@ pub trait SyscallInterface: Send + Sync {
 		let _lock = DRIVER_LOCK.lock();
 
 		match arch::kernel::pci::get_network_driver() {
-			Some(driver) => Ok(driver.borrow().get_mtu()),
+			Some(driver) => Ok(driver.lock().get_mtu()),
 			_ => Err(()),
 		}
 	}
@@ -185,7 +185,7 @@ pub trait SyscallInterface: Send + Sync {
 		let _lock = DRIVER_LOCK.lock();
 
 		match arch::kernel::pci::get_network_driver() {
-			Some(driver) => driver.borrow().has_packet(),
+			Some(driver) => driver.lock().has_packet(),
 			_ => false,
 		}
 	}
@@ -194,7 +194,7 @@ pub trait SyscallInterface: Send + Sync {
 		let _lock = DRIVER_LOCK.lock();
 
 		match arch::kernel::pci::get_network_driver() {
-			Some(driver) => driver.borrow_mut().get_tx_buffer(len),
+			Some(driver) => driver.lock().get_tx_buffer(len),
 			_ => Err(()),
 		}
 	}
@@ -203,7 +203,7 @@ pub trait SyscallInterface: Send + Sync {
 		let _lock = DRIVER_LOCK.lock();
 
 		match arch::kernel::pci::get_network_driver() {
-			Some(driver) => driver.borrow_mut().send_tx_buffer(handle, len),
+			Some(driver) => driver.lock().send_tx_buffer(handle, len),
 			_ => Err(()),
 		}
 	}
@@ -212,7 +212,7 @@ pub trait SyscallInterface: Send + Sync {
 		let _lock = DRIVER_LOCK.lock();
 
 		match arch::kernel::pci::get_network_driver() {
-			Some(driver) => driver.borrow().receive_rx_buffer(),
+			Some(driver) => driver.lock().receive_rx_buffer(),
 			_ => Err(()),
 		}
 	}
@@ -222,7 +222,7 @@ pub trait SyscallInterface: Send + Sync {
 
 		match arch::kernel::pci::get_network_driver() {
 			Some(driver) => {
-				driver.borrow_mut().rx_buffer_consumed();
+				driver.lock().rx_buffer_consumed();
 				Ok(())
 			}
 			_ => Err(()),
